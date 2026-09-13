@@ -14,6 +14,8 @@ pub const ComputeEngine = engine.ComputeEngine;
 pub const bench = bench_mod;
 pub const gpu = gpu_pipeline;
 pub const GpuContext = gpu_context.GpuContext;
+pub const ProbeFailure = gpu_context.ProbeFailure;
+pub const ProbeResult = gpu_context.ProbeResult;
 
 /// Compatibility helper retained for the Task 1 CLI template.
 pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
@@ -146,6 +148,24 @@ test "gpu webgpu saxpy matches CPU backends" {
     try gpu_pipeline.saxpyWithContext(&context, alpha, out_gpu, x, y);
     try std.testing.expectEqualSlices(f32, out_scalar, out_simd);
     try std.testing.expectEqualSlices(f32, out_scalar, out_gpu);
+}
+
+test "gpu fallback keeps the CPU result and exposes its reason" {
+    gpu_context.setProbeOverrideForTesting(
+        gpu_context.ProbeResult.unavailable(.adapter_unavailable),
+    );
+    defer gpu_context.resetGlobal();
+
+    const a = [_]f32{2.0} ** 17;
+    const b = [_]f32{3.0} ** 17;
+    var out: [17]f32 = undefined;
+    ComputeEngine(.gpu_webgpu).add(f32, &out, &a, &b);
+
+    for (out) |value| try std.testing.expectEqual(@as(f32, 5.0), value);
+    try std.testing.expectEqualStrings(
+        "WebGPU adapter request failed or returned no adapter",
+        gpu_context.lastFallbackReason().?,
+    );
 }
 
 // 其它 test 块分散在 submodule，root 引用即可。

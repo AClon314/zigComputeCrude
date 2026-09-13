@@ -318,19 +318,54 @@ pub fn addBatchedWithContext(
     try readResult(self, resources, out, byte_size);
 }
 
+/// Record a fallback from the comptime engine without exposing the context
+/// cache to callers.
+pub fn recordFallback(reason: []const u8) void {
+    context_mod.recordFallback(reason);
+}
+
+pub fn clearFallbackReason() void {
+    context_mod.clearFallbackReason();
+}
+
+pub fn lastFallbackReason() ?[]const u8 {
+    return context_mod.lastFallbackReason();
+}
+
 pub fn add(out: []f32, a: []const f32, b: []const f32) !void {
-    const self = try context_mod.global();
-    try addWithContext(self, out, a, b);
+    clearFallbackReason();
+    const self = context_mod.global() catch |err| {
+        if (lastFallbackReason() == null) recordFallback(@errorName(err));
+        return err;
+    };
+    addWithContext(self, out, a, b) catch |err| {
+        recordFallback(@errorName(err));
+        return err;
+    };
 }
 
 pub fn saxpy(alpha: f32, out: []f32, x: []const f32, y: []const f32) !void {
-    const self = try context_mod.global();
-    try saxpyWithContext(self, alpha, out, x, y);
+    clearFallbackReason();
+    const self = context_mod.global() catch |err| {
+        if (lastFallbackReason() == null) recordFallback(@errorName(err));
+        return err;
+    };
+    saxpyWithContext(self, alpha, out, x, y) catch |err| {
+        recordFallback(@errorName(err));
+        return err;
+    };
 }
 
 pub fn addBatched(out: []f32, a: []const f32, b: []const f32, iters: usize) !void {
-    const self = try context_mod.global();
-    try addBatchedWithContext(self, out, a, b, iters);
+    clearFallbackReason();
+    const self = context_mod.global() catch |err| {
+        if (lastFallbackReason() == null) recordFallback(@errorName(err));
+        return err;
+    };
+    addBatchedWithContext(self, out, a, b, iters) catch |err| {
+        recordFallback(@errorName(err));
+        return err;
+    };
 }
 
 // Kept in this module so map callback setup cannot accidentally be changed to

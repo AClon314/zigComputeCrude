@@ -40,10 +40,14 @@ fn addWithBackend(
             return true;
         },
         .gpu_webgpu => {
-            computeAccel.gpu.add(out, a, b) catch {
+            computeAccel.gpu.add(out, a, b) catch |err| {
                 // A machine without a WebGPU adapter must still produce a
                 // correct result rather than turning a manual selection into a
-                // panic.
+                // panic.  The pipeline records the detailed probe/operation
+                // reason; retain the error name as a final safety net.
+                if (computeAccel.gpu.lastFallbackReason() == null) {
+                    computeAccel.gpu.recordFallback(@errorName(err));
+                }
                 computeAccel.ComputeEngine(.cpu_simd).add(f32, out, a, b);
                 return false;
             };
@@ -164,18 +168,10 @@ pub fn main(init: std.process.Init) !void {
     @memset(a.cpu_ptr, 2.0);
     @memset(b.cpu_ptr, 3.0);
 
-    try stdout_writer.print(
-        "selected backend = {s}  (mode={s}, size={}, iters={})\n",
-        .{ chosen.name(), modeName(mode), size, iters },
-    );
-
     a.toDevice();
     b.toDevice();
-    const gpu_executed = addWithBackend(chosen, res.cpu_ptr, a.cpu_ptr, b.cpu_ptr);
+    var gpu_executed = addWithBackend(chosen, res.cpu_ptr, a.cpu_ptr, b.cpu_ptr);
     res.toHost();
-    if (chosen == .gpu_webgpu and !gpu_executed) {
-        try stdout_writer.print("gpu_webgpu unavailable; used cpu_simd fallback\n", .{});
-    }
 
     const scalar_ns = computeAccel.bench.timeAdd(
         f32,
@@ -209,17 +205,21 @@ pub fn main(init: std.process.Init) !void {
     );
     try stdout_writer.print("speedup (scalar/simd) = {d:.2}x\n", .{speedup});
 
+    var gpu_measurement_failed = false;
+    var gpu_measurement_reason: ?[]const u8 = null;
     if (chosen == .gpu_webgpu and gpu_executed) {
-        const gpu_ns = computeAccel.bench.timeGpuAdd(
+        const gpu_ns: u64 = computeAccel.bench.timeGpuAdd(
             res.cpu_ptr,
             a.cpu_ptr,
             b.cpu_ptr,
             iters,
-        ) catch gpu_measurement: {
-            try stdout_writer.print("gpu_webgpu measurement failed; used cpu_simd fallback\n", .{});
-            break :gpu_measurement 0;
+        ) catch |err| blk: {
+            gpu_measurement_failed = true;
+            gpu_measurement_reason =
+                computeAccel.gpu.lastFallbackReason() orelse @errorName(err);
+            break :blk 0;
         };
-        if (gpu_ns != 0) {
+        if (!gpu_measurement_failed and gpu_ns != 0) {
             const gpu_speedup = @as(f64, @floatFromInt(simd_ns)) /
                 @as(f64, @floatFromInt(gpu_ns));
             try stdout_writer.print(
@@ -229,15 +229,16 @@ pub fn main(init: std.process.Init) !void {
             try stdout_writer.print("speedup (gpu/cpu_simd) = {d:.2}x\n", .{gpu_speedup});
         }
 
-        if (iters > 1) {
+        if (!gpu_measurement_failed and iters > 1) {
             const batch_ns = computeAccel.bench.timeGpuAddBatched(
                 res.cpu_ptr,
                 a.cpu_ptr,
                 b.cpu_ptr,
                 iters,
-            ) catch gpu_batch_measurement: {
-                try stdout_writer.print("gpu batch measurement failed\n", .{});
-                break :gpu_batch_measurement 0;
+            ) catch |err| blk: {
+                const reason = computeAccel.gpu.lastFallbackReason() orelse @errorName(err);
+                try stdout_writer.print("gpu_batch measurement failed: {s}\n", .{reason});
+                break :blk 0;
             };
             if (batch_ns != 0) {
                 const batch_speedup = @as(f64, @floatFromInt(simd_ns)) /
@@ -247,6 +248,64 @@ pub fn main(init: std.process.Init) !void {
                     .{ batch_ns, throughputGbps(size, iters, batch_ns) },
                 );
                 try stdout_writer.print("speedup (gpu_batch/cpu_simd) = {d:.2}x\n", .{batch_speedup});
+            }
+        }
+    }
+
+    // A failed measurement is also a failed GPU execution path for this run.
+    // Recompute the visible result with CPU SIMD before reporting the effective
+    // backend, so a transient GPU error cannot leave a misleading GPU result.
+    if (chosen == .gpu_webgpu and gpu_measurement_failed) {
+        gpu_executed = false;
+        computeAccel.ComputeEngine(.cpu_simd).add(f32, res.cpu_ptr, a.cpu_ptr, b.cpu_ptr);
+        res.toHost();
+    }
+
+    if (chosen == .gpu_webgpu) {
+        if (gpu_executed) {
+            try stdout_writer.print(
+                "selected backend = gpu_webgpu  (mode={s}, size={}, iters={})\n",
+                .{ modeName(mode), size, iters },
+            );
+        } else {
+            const reason = gpu_measurement_reason orelse
+                (computeAccel.gpu.lastFallbackReason() orelse "GPU operation unavailable");
+            try stdout_writer.print(
+                "selected backend = gpu_webgpu (fell back: {s})  (mode={s}, size={}, iters={})\n",
+                .{ reason, modeName(mode), size, iters },
+            );
+        }
+    } else {
+        try stdout_writer.print(
+            "selected backend = {s}  (mode={s}, size={}, iters={})\n",
+            .{ chosen.name(), modeName(mode), size, iters },
+        );
+    }
+
+    if (mode == .benchmark) {
+        if (computeAccel.bench.lastPickReport()) |report| {
+            if (!report.gpu_probe.available) {
+                try stdout_writer.print(
+                    "selection: gpu_webgpu 未纳入端到端 bench（能力探测失败: {s}），保留 {s}\n",
+                    .{ report.gpu_probe.reason, report.selected.name() },
+                );
+            } else if (report.gpu_ns) |measured_gpu_ns| {
+                if (report.selected == .gpu_webgpu) {
+                    try stdout_writer.print(
+                        "selection: gpu_webgpu 探测成功且端到端实测最快（gpu={}ns, cpu_simd={}ns）\n",
+                        .{ measured_gpu_ns, report.simd_ns },
+                    );
+                } else {
+                    try stdout_writer.print(
+                        "selection: gpu_webgpu 探测成功但端到端实测未胜出（gpu={}ns, cpu_simd={}ns），保留 {s}\n",
+                        .{ measured_gpu_ns, report.simd_ns, report.selected.name() },
+                    );
+                }
+            } else {
+                try stdout_writer.print(
+                    "selection: gpu_webgpu 探测成功但端到端执行失败（{s}），未纳入选择，保留 {s}\n",
+                    .{ report.gpu_failure_reason orelse "unknown GPU error", report.selected.name() },
+                );
             }
         }
     }

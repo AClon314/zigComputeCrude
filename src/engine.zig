@@ -20,7 +20,10 @@ pub fn ComputeEngine(comptime bt: BackendType) type {
                 .cpu_simd => addSimd(T, out, a, b),
                 .gpu_webgpu => if (T == f32) {
                     gpu_pipeline.add(out, a, b) catch addSimd(T, out, a, b);
-                } else addSimd(T, out, a, b),
+                } else {
+                    gpu_pipeline.recordFallback("gpu_webgpu is only available for f32; used cpu_simd");
+                    addSimd(T, out, a, b);
+                },
                 .gpu_cuda => @panic("computeAccel: gpu_cuda backend not implemented"),
             }
         }
@@ -33,7 +36,10 @@ pub fn ComputeEngine(comptime bt: BackendType) type {
                 .cpu_simd => saxpySimd(T, alpha, out, x, y),
                 .gpu_webgpu => if (T == f32) {
                     gpu_pipeline.saxpy(alpha, out, x, y) catch saxpySimd(T, alpha, out, x, y);
-                } else saxpySimd(T, alpha, out, x, y),
+                } else {
+                    gpu_pipeline.recordFallback("gpu_webgpu is only available for f32; used cpu_simd");
+                    saxpySimd(T, alpha, out, x, y);
+                },
                 .gpu_cuda => @panic("computeAccel: gpu_cuda backend not implemented"),
             }
         }

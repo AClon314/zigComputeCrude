@@ -11,7 +11,7 @@
 |---|---|---|
 | `cpu_scalar` | ✅ | 标量循环（兜底） |
 | `cpu_simd` | ✅ | `@Vector(8, f32)` SIMD |
-| `gpu_webgpu` | ✅ native + browser | native: wgpu-native v29.0.1.1；browser: emdawnwebgpu v20260911.162847（wasm）；WGSL `add` / `saxpy`，运行时失败回退 CPU |
+| `gpu_webgpu` | ✅ native + browser | native: wgpu-native v29.0.1.1；browser: emdawnwebgpu v20260911.162847（wasm）；WGSL `add` / `saxpy`，运行时失败会明确标注并回退 CPU |
 | `gpu_cuda` | ⬜ | 未实现 |
 
 ## 构建与运行
@@ -174,6 +174,45 @@ GPU add: MATCH (n=1048576, gpu=31.000 ms, cpu_simd=0.800 ms)
 
 ## 选择逻辑
 
-- `manual`：`--backend <name>` 显式选择。
-- `heuristic`：`size >= 1024` 选择 `cpu_simd`，否则 `cpu_scalar`。
-- `benchmark`：`--auto` 实测已经实现的后端；GPU 初始化/执行失败仍保留 CPU 回退。
+- `manual`：`--backend <name>` 是显式请求。请求 `gpu_webgpu` 不代表一定会由
+  GPU 执行；初始化或运算失败时仍保证 CPU 结果正确，并在选择行写出
+  `gpu_webgpu (fell back: <reason>)`。
+- `heuristic`：小于 `gpu_threshold = 1<<22` 时只在 CPU scalar/SIMD 中选择（`size >=
+  1024` 为 `cpu_simd`）。达到 GPU 闸门后，先调用一次缓存的
+  `GpuContext.probe()`；只有探测成功才返回 `gpu_webgpu`，否则返回 `cpu_simd`。
+  这个阈值是根据本机 T1 实测确定的保守闸门：`size=1<<20` 时 GPU 端到端
+  4.652 GB/s、CPU SIMD 14.676 GB/s，不能把“有 GPU”当成“GPU 更快”。
+- `benchmark`：`--auto` 先做能力探测，然后只把探测成功的 GPU 纳入**端到端**
+  `add` bench（每次都包含上传、dispatch、copy、map/readback）；GPU 错误直接从
+  候选集中剔除，不会用 CPU fallback 的时间冒充 GPU。CLI 会说明 GPU 是否可用、
+  实测 ns 与 `cpu_simd` 的比较，以及最终为什么保留某个后端。
+- `gpu_batch` 仍是单独的 steady-state 观察项（一次上传/一次 readback、多次真实
+  dispatch），不参与 `--auto`，也不能和 CPU 的端到端数字混称。
+
+## 能力探测与回退语义
+
+`GpuContext.probe()` 在 native 进程内用线程安全的一次性缓存建立 instance、adapter、
+device 和 queue。成功与失败都缓存；失败的 `ProbeResult` 同时提供 `failure` 枚举和
+稳定的 `reason` 文本，例如 instance 创建失败、adapter/device 请求失败或初始化回调
+超时。成功探测得到的 context 会直接供后续 GPU 调用复用，不会“探测一次、执行时再
+悄悄建另一个 context”。`resetGlobal()` 仅供测试或明确要重试驱动环境的应用使用。
+
+低层 `computeAccel.gpu.add` / `saxpy` 保留 `!void` 错误，让调用方能区分 GPU 失败；
+`ComputeEngine(.gpu_webgpu)` 为兼容原有的 `void` API 仍会回退 `cpu_simd`，但会记录
+原因。可通过 `computeAccel.gpu.lastFallbackReason()` 查询最近一次回退；CLI 和自动
+选择不会把这条路径打印成普通 GPU 结果。对非 `f32` 类型也会明确记录“仅支持 f32”
+后回退 CPU SIMD。
+
+例如人为禁用 Vulkan ICD：
+
+```bash
+VK_ICD_FILENAMES=/nonexistent.json \
+  zig build run -- --backend gpu_webgpu --size 1048576
+```
+
+输出会保留正确的 `5.0` 结果，并类似下面明确标注原因，而不是打印普通 GPU 行：
+
+```text
+selected backend = gpu_webgpu (fell back: WebGPU device request failed or returned no device) ...
+result sample: 5.0, 5.0, 5.0, 5.0 (expected 5.0)
+```

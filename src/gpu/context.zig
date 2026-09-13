@@ -5,6 +5,64 @@ const wgpu = @import("webgpu.zig");
 /// the public engine API can then fall back to a CPU implementation.
 pub const GpuError = error{GpuError};
 
+/// Why the one-time capability probe failed.  The enum is intentionally more
+/// useful to callers than a bare bool, while the accompanying `reason` string
+/// remains stable and allocation-free for CLI diagnostics.
+pub const ProbeFailure = enum {
+    not_probed,
+    none,
+    instance_unavailable,
+    adapter_unavailable,
+    adapter_info_unavailable,
+    device_unavailable,
+    queue_unavailable,
+    initialization_timeout,
+    unsupported_type,
+
+    pub fn reason(self: ProbeFailure) []const u8 {
+        return switch (self) {
+            .not_probed => "WebGPU capability has not been probed",
+            .none => "WebGPU instance, adapter, device and queue are available",
+            .instance_unavailable => "wgpuCreateInstance returned null (no WebGPU instance)",
+            .adapter_unavailable => "WebGPU adapter request failed or returned no adapter",
+            .adapter_info_unavailable => "wgpuAdapterGetInfo failed",
+            .device_unavailable => "WebGPU device request failed or returned no device",
+            .queue_unavailable => "wgpuDeviceGetQueue returned null",
+            .initialization_timeout => "WebGPU initialization callback timed out",
+            .unsupported_type => "gpu_webgpu is only available for f32 operations",
+        };
+    }
+};
+
+pub const ProbeResult = struct {
+    available: bool,
+    failure: ProbeFailure,
+    reason: []const u8,
+    adapter_backend_type: wgpu.WGPUBackendType = wgpu.WGPUBackendType_Undefined,
+    adapter_vendor_id: u32 = 0,
+
+    pub fn isAvailable(self: ProbeResult) bool {
+        return self.available;
+    }
+
+    pub fn unavailable(failure: ProbeFailure) ProbeResult {
+        return .{
+            .available = false,
+            .failure = failure,
+            .reason = failure.reason(),
+        };
+    }
+};
+
+const InitFailure = error{
+    InstanceUnavailable,
+    AdapterUnavailable,
+    AdapterInfoUnavailable,
+    DeviceUnavailable,
+    QueueUnavailable,
+    InitializationTimeout,
+};
+
 pub const PipelineCache = struct {
     shader_module: wgpu.WGPUShaderModule = null,
     pipeline: wgpu.WGPUComputePipeline = null,
@@ -132,11 +190,19 @@ pub const GpuContext = struct {
     pipelines: [2]PipelineCache = .{ .{}, .{} },
     resources: [2]BufferCache = .{ .{}, .{} },
 
+    /// Explicit context construction keeps the original small `GpuError`
+    /// contract.  The one-time probe below uses `initDetailed` so it can tell
+    /// callers which initialization stage failed.
     pub fn init(allocator: std.mem.Allocator) !GpuContext {
+        return initDetailed(allocator) catch return error.GpuError;
+    }
+
+    fn initDetailed(allocator: std.mem.Allocator) InitFailure!GpuContext {
         var self = GpuContext{ .allocator = allocator };
         errdefer self.deinit();
 
-        self.instance = wgpu.wgpuCreateInstance(null) orelse return error.GpuError;
+        self.instance = wgpu.wgpuCreateInstance(null) orelse
+            return error.InstanceUnavailable;
 
         var adapter_state = AdapterRequestState{};
         _ = wgpu.wgpuInstanceRequestAdapter(self.instance, null, .{
@@ -146,11 +212,11 @@ pub const GpuContext = struct {
             .userdata1 = @ptrCast(&adapter_state),
             .userdata2 = null,
         });
-        try self.waitFor(&adapter_state);
+        self.waitForInitialization(&adapter_state) catch return error.InitializationTimeout;
         if (adapter_state.status != wgpu.WGPURequestAdapterStatus_Success or
             adapter_state.adapter == null)
         {
-            return error.GpuError;
+            return error.AdapterUnavailable;
         }
         self.adapter = adapter_state.adapter;
 
@@ -169,7 +235,7 @@ pub const GpuContext = struct {
         };
         const info_status = wgpu.wgpuAdapterGetInfo(self.adapter, &info);
         defer wgpu.wgpuAdapterInfoFreeMembers(info);
-        if (info_status != wgpu.WGPUStatus_Success) return error.GpuError;
+        if (info_status != wgpu.WGPUStatus_Success) return error.AdapterInfoUnavailable;
         self.adapter_backend_type = info.backendType;
         self.adapter_vendor_id = info.vendorID;
 
@@ -181,16 +247,24 @@ pub const GpuContext = struct {
             .userdata1 = @ptrCast(&device_state),
             .userdata2 = null,
         });
-        try self.waitFor(&device_state);
+        self.waitForInitialization(&device_state) catch return error.InitializationTimeout;
         if (device_state.status != wgpu.WGPURequestDeviceStatus_Success or
             device_state.device == null)
         {
-            return error.GpuError;
+            return error.DeviceUnavailable;
         }
         self.device = device_state.device;
-        self.queue = wgpu.wgpuDeviceGetQueue(self.device) orelse return error.GpuError;
+        self.queue = wgpu.wgpuDeviceGetQueue(self.device) orelse
+            return error.QueueUnavailable;
 
         return self;
+    }
+
+    /// Return the cached native WebGPU capability result.  The static method
+    /// form keeps the probe discoverable as part of `GpuContext` while the
+    /// cache itself lives at module scope.
+    pub fn probe() ProbeResult {
+        return probeCached();
     }
 
     pub fn deinit(self: *GpuContext) void {
@@ -221,6 +295,12 @@ pub const GpuContext = struct {
     /// progress mechanism used by the native backend.
     pub fn pump(self: *GpuContext) void {
         if (self.instance) |instance| wgpu.wgpuInstanceProcessEvents(instance);
+    }
+
+    fn waitForInitialization(self: *GpuContext, state: anytype) error{InitializationTimeout}!void {
+        var attempts: usize = 0;
+        while (!state.done and attempts < 100_000) : (attempts += 1) self.pump();
+        if (!state.done) return error.InitializationTimeout;
     }
 
     pub fn waitFor(self: *GpuContext, state: anytype) !void {
@@ -340,18 +420,133 @@ fn emptyStringView() wgpu.WGPUStringView {
 }
 
 var global_context: ?GpuContext = null;
+var probe_done: bool = false;
+var cached_probe: ProbeResult = ProbeResult.unavailable(.not_probed);
+var probe_override_for_testing: ?ProbeResult = null;
+var probe_mutex: std.atomic.Mutex = .unlocked;
+
+var fallback_reason: ?[]const u8 = null;
+var fallback_mutex: std.atomic.Mutex = .unlocked;
+
+fn lock(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
+fn failureForInitError(err: InitFailure) ProbeFailure {
+    return switch (err) {
+        error.InstanceUnavailable => .instance_unavailable,
+        error.AdapterUnavailable => .adapter_unavailable,
+        error.AdapterInfoUnavailable => .adapter_info_unavailable,
+        error.DeviceUnavailable => .device_unavailable,
+        error.QueueUnavailable => .queue_unavailable,
+        error.InitializationTimeout => .initialization_timeout,
+    };
+}
+
+fn probeLocked() ProbeResult {
+    if (probe_done) return cached_probe;
+    if (probe_override_for_testing) |override| {
+        cached_probe = override;
+        probe_done = true;
+        return cached_probe;
+    }
+
+    const context = GpuContext.initDetailed(std.heap.page_allocator) catch |err| {
+        cached_probe = ProbeResult.unavailable(failureForInitError(err));
+        probe_done = true;
+        return cached_probe;
+    };
+
+    global_context = context;
+    cached_probe = .{
+        .available = true,
+        .failure = .none,
+        .reason = ProbeFailure.none.reason(),
+        .adapter_backend_type = context.adapter_backend_type,
+        .adapter_vendor_id = context.adapter_vendor_id,
+    };
+    probe_done = true;
+    return cached_probe;
+}
+
+/// Probe native WebGPU exactly once per process.  Both success and failure
+/// are cached, and the mutex also serializes initialization with `global()`.
+/// A successful probe owns the context used by subsequent GPU operations, so
+/// selection does not probe once and then silently initialize a different
+/// context later.
+fn probeCached() ProbeResult {
+    lock(&probe_mutex);
+    defer probe_mutex.unlock();
+    return probeLocked();
+}
+
+/// Top-level alias for callers that do not retain the context type.
+pub fn probe() ProbeResult {
+    return probeCached();
+}
 
 /// The comptime-dispatched engine has a void API, so its GPU implementation
 /// uses one process-local context.  Explicit callers/tests can still construct
 /// and own a GpuContext directly.
 pub fn global() !*GpuContext {
-    if (global_context == null) {
-        global_context = try GpuContext.init(std.heap.page_allocator);
+    lock(&probe_mutex);
+    defer probe_mutex.unlock();
+
+    const result = if (global_context != null) cached_probe else probeLocked();
+    if (!result.available) {
+        recordFallback(result.reason);
+        return error.GpuError;
     }
     return &global_context.?;
 }
 
+/// Reset the process-local GPU state.  This is primarily useful for tests and
+/// for applications that intentionally want to retry after changing their
+/// driver environment; ordinary callers should rely on the one-time cache.
 pub fn resetGlobal() void {
+    lock(&probe_mutex);
+    defer probe_mutex.unlock();
+
     if (global_context) |*context| context.deinit();
     global_context = null;
+    probe_done = false;
+    cached_probe = ProbeResult.unavailable(.not_probed);
+    probe_override_for_testing = null;
+    clearFallbackReason();
+}
+
+/// Test-only dependency injection for the unavailable-device path.  A
+/// successful override is intentionally not supported because a fake result
+/// must not manufacture a fake `GpuContext`; tests should inject failure only.
+pub fn setProbeOverrideForTesting(override: ?ProbeResult) void {
+    lock(&probe_mutex);
+    defer probe_mutex.unlock();
+
+    if (global_context) |*context| context.deinit();
+    global_context = null;
+    probe_done = false;
+    cached_probe = ProbeResult.unavailable(.not_probed);
+    probe_override_for_testing = override;
+    clearFallbackReason();
+}
+
+/// Record why a void GPU engine call had to use its CPU implementation.  All
+/// current callers pass static strings (`ProbeResult.reason` or `@errorName`),
+/// so no allocation or lifetime management is needed.
+pub fn recordFallback(reason_text: []const u8) void {
+    lock(&fallback_mutex);
+    defer fallback_mutex.unlock();
+    fallback_reason = reason_text;
+}
+
+pub fn clearFallbackReason() void {
+    lock(&fallback_mutex);
+    defer fallback_mutex.unlock();
+    fallback_reason = null;
+}
+
+pub fn lastFallbackReason() ?[]const u8 {
+    lock(&fallback_mutex);
+    defer fallback_mutex.unlock();
+    return fallback_reason;
 }
