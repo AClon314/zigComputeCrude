@@ -74,6 +74,8 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "tools",
+        "deps",
         // For example...
         //"LICENSE",
         //"README.md",

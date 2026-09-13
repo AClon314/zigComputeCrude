@@ -108,6 +108,7 @@ zig build test --summary all     # 全绿（含 ABI 检查与 tree-shake 门禁�
 zig build wasm                   # 成功（浏览器路径不回归）
 tools/check_abi_drift.sh         # OK
 zig build tree-shake             # CPU-only 消费者产物无 wgpu/WGSL/spatial 符号
+zig build consumer-check         # examples/cpu_consumer 作为 path 依赖可构建可运行
 ```
 
 tree-shake 门禁有正负两侧：`build.zig` 里的 probe 只调用 CPU 路径（必须过）；
@@ -127,6 +128,7 @@ tree-shake 门禁有正负两侧：`build.zig` 里的 probe 只调用 CPU 路径
 | emdawnwebgpu（browser） | 保留 | 唯一现实的浏览器 WebGPU + 同形 C ABI |
 | 原语（scan/sort/BVH/texture…） | 自研 | 无跨 desktop+browser 的现成可移植库（详见 docs §5） |
 | C/C++ 领域库（OIIO/OCIO/OIDN/FastNoise2…） | 按需、CPU 侧 | 强在 I/O/色彩/去噪；不进 WebGPU 核心 |
+| wgpu-native 二进制 | vendored（默认）或 `-Dwgpu-lib-dir` | `vendor/` 不入包（不入库），发布形态由消费者指路 |
 | Halide / naga / Dawn(native) / SPIR-V | 备选 | 只有放弃浏览器或要行为对齐时才评估 |
 
 ## 7. 提交与工作方式

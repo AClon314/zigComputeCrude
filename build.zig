@@ -25,6 +25,14 @@ pub fn build(b: *std.Build) void {
         "webgpu",
         "link wgpu-native (native WebGPU backend); set false for CPU-only consumers",
     ) orelse true;
+    // Where to find libwgpu_native.so + include/ (defaults to the vendored copy).
+    // Published packages cannot ship vendor/, so consumers point this at their
+    // own wgpu-native build.
+    const wgpu_lib_dir_option = b.option(
+        []const u8,
+        "wgpu-lib-dir",
+        "directory containing libwgpu_native.so and include/ (default: vendor/wgpu-native/lib)",
+    );
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -57,12 +65,17 @@ pub fn build(b: *std.Build) void {
     // installed rpath plus copied .so makes `zig build run` relocatable under
     // zig-out/{bin,lib}.
     if (target.result.os.tag == .linux and webgpu_enabled) {
-        const wgpu_lib_dir = b.path("vendor/wgpu-native/lib");
+        const wgpu_lib_dir = if (wgpu_lib_dir_option) |dir|
+            b.path(dir)
+        else
+            b.path("vendor/wgpu-native/lib");
         mod.addLibraryPath(wgpu_lib_dir);
         mod.linkSystemLibrary("wgpu_native", .{ .use_pkg_config = .no });
         mod.addRPath(wgpu_lib_dir);
         mod.addRPathSpecial("$ORIGIN/../lib");
-        b.installFile("vendor/wgpu-native/lib/libwgpu_native.so", "lib/libwgpu_native.so");
+        if (wgpu_lib_dir_option == null) {
+            b.installFile("vendor/wgpu-native/lib/libwgpu_native.so", "lib/libwgpu_native.so");
+        }
     }
 
     // Spatial primitives (S1) live in their own module: a consumer that never
@@ -205,6 +218,16 @@ pub fn build(b: *std.Build) void {
     shake_check.addFileArg(b.path("tools/check_tree_shake.sh"));
     shake_check.addFileArg(shake_obj.getEmittedBin());
     test_step.dependOn(&shake_check.step);
+
+    // Package-consumer check: the example consumer depends on this package by
+    // path, imports only `computeAccel`, builds with `-Dwebgpu=false`, and must
+    // run without wgpu-native.  This is the end-to-end packaging gate.
+    const consumer_check = b.addSystemCommand(&.{"bash"});
+    consumer_check.addFileArg(b.path("tools/check_consumer.sh"));
+    test_step.dependOn(&consumer_check.step);
+
+    const consumer_step = b.step("consumer-check", "构建并运行示例消费者（CPU-only 打包验证）");
+    consumer_step.dependOn(&consumer_check.step);
 
     const tree_shake_step = b.step("tree-shake", "断言 CPU-only 消费者不编译 GPU/空间模块");
     tree_shake_step.dependOn(&shake_check.step);

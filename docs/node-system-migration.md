@@ -297,6 +297,12 @@ docs/ tools/                # 保持
    属于**中间件**；本库只提供它们需要的原语与调度。`Shader nodes` 是独立的
    编译器项目，不在本库范围。
 
+**Step 8（打包验证，已实现）**：新增 `examples/cpu_consumer/`（path 依赖本包、
+只 import `computeAccel`、`-Dwebgpu=false`），`zig build consumer-check` 会构建并运行它，
+并断言二进制没有链接 wgpu-native（`ldd`）；`build.zig` 增加 `-Dwgpu-lib-dir` 让发布
+形态的消费者指向自己的 wgpu-native（`vendor/` 不入包）。该检查与 tree-shake 一起
+接进 `zig build test`。
+
 **Step 7（S1 邻接表，已实现）**：查询 kernel 增加第 8 个 binding（`neighbors`），
 按 `max_neighbors` 容量写每个查询的邻居点索引（`neighbors[q*K + j]`），计数仍在
 `out_counts`；CPU 参考 `queryNeighbors` 同语义，测试在稀疏场景（count ≤ K）比较

@@ -66,10 +66,20 @@ tools/check_abi_drift.sh            # 绑定 ABI 漂移检查（native vs emdawn
 
 ```zig
 // 消费者 build.zig
-const accel = b.dependency("computeAccel", .{ .target = target, .optimize = optimize });
+const accel = b.dependency("computeAccel", .{
+    .target = target,
+    .optimize = optimize,
+    .webgpu = false, // CPU-only 消费者：不链接 wgpu-native（也不需要它存在）
+});
 exe.root_module.addImport("computeAccel", accel.module("computeAccel"));
 exe.root_module.addImport("computeAccel_spatial", accel.module("computeAccel_spatial")); // 可选
 ```
+
+完整可运行示例见 `examples/cpu_consumer/`（path 依赖 + `-Dwebgpu=false`），
+`zig build consumer-check` 会在本仓库里构建并运行它，并断言二进制没有链接
+wgpu-native。GPU 消费者需要提供 wgpu-native：仓库内默认用 `vendor/wgpu-native/lib`
+（`tools/fetch_deps.sh` 拉取），发布形态下可用 `-Dwgpu-lib-dir=<目录>` 指向自己的
+构建产物（published 包不包含 `vendor/`）。
 
 Zig 是**惰性分析**：没被引用的声明（函数/类型/泛型实例/整个文件）不会被语义分析，
 更不会进入产物——所以未使用的 module/内核零成本，不需要 TS 那种 `sideEffects` 注解。
@@ -261,8 +271,10 @@ GPU 稳态 16.2 GB/s —— 这正是 M0 runtime 要解决的问题。
 常用命令：
 
 ```bash
-zig build test --summary all        # 全绿是硬门槛
+zig build test --summary all        # 全绿是硬门槛（含 tree-shake 与 consumer 门禁）
 zig build wasm                      # 浏览器路径不得回归
 tools/check_abi_drift.sh            # 改绑定后必须过
 zig build abi-check                 # 严格模式（CI / 升级依赖）
+zig build tree-shake                # CPU-only 消费者对象无 wgpu/WGSL/spatial 符号
+zig build consumer-check            # 示例消费者（path 依赖 + CPU-only）能构建并运行
 ```

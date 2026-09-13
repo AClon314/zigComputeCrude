@@ -1,0 +1,16 @@
+.{
+    .name = .cpu_consumer,
+    .version = "0.0.0",
+    .fingerprint = 0x72c902517405c62a,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Path dependency: the demo lives next to computeAccel.  A real
+        // consumer would use `.url` + `.hash` from `zig fetch --save`.
+        .computeAccel = .{ .path = "../.." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
