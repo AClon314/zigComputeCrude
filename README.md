@@ -137,7 +137,12 @@ for (0..steps) |_| {
     try chain.dispatch(&kernel, bind, &.{ &x, &y, &result, &params }, grid);
 }
 try chain.download(&result, std.mem.sliceAsBytes(host_out));
-try chain.submit();
+try chain.submit();                 // 提交并阻塞回读
+
+// 或者异步：提交后先做 CPU 工作，再统一回读
+// try chain.submitAsync();  // 不阻塞
+// ... 准备下一批参数 / 提交更多 chain ...
+// try chain.wait();         // 只在这里阻塞并映射结果
 ```
 
 已验证的收益见下文「M0 消融实验」。设计原则：runtime 只做**常驻、链式、脏标记**三件事，

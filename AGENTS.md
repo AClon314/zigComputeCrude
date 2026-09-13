@@ -153,6 +153,9 @@ tree-shake 门禁有正负两侧：`build.zig` 里的 probe 只调用 CPU 路径
   对 validation error 直接 abort）。做法：写 count 与间接派发拆成两次 dispatch、
   两个 shader（参见 `indirect_probe.wgsl` / `indirect_fill.wgsl` 与
   `Chain.dispatchIndirect` 的测试）；control buffer 用 `runtime.buffer.indirect`。
+- **`Chain.wait()` 必须被调用**：`submitAsync()` 只提交，不调用 `wait()` 时
+  `download()` 的 out 切片不会被写入（数据仍在 device 上），`deinit()` 也不会自动
+  `wait`；每个 submit 路径都要配一次 wait（`submit()` = 两者合一）。
 - **scan 的块内分配必须连续**：单 workgroup 扫块前缀和时，每个线程要拿**连续**块
   （`[lid*chunk, (lid+1)*chunk)`），跨步分块会破坏前缀顺序（已在
   `scan.wgsl::block_scan_global` 修正）。

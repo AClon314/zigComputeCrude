@@ -297,6 +297,13 @@ docs/ tools/                # 保持
    属于**中间件**；本库只提供它们需要的原语与调度。`Shader nodes` 是独立的
    编译器项目，不在本库范围。
 
+**Step 6（M1 异步 readback，已实现）**：`Chain.submitAsync()` 只做
+end-pass/录制 copy/提交，`Chain.wait()` 才映射并拷贝 download；`submit()` 保持
+同步语义（= 两者）。测试覆盖"提交两条链 → 断言 out 仍是哨兵（未阻塞映射）→
+CPU 算参考 → wait 两条 → 逐元素一致"。GPU timestamp 暂缓：需要
+`timestamp-query` feature（设备请求要带 requiredFeatures）且浏览器端支持不一致，
+待有真实 profiling 需求时再做（docs 风险清单里已记）。
+
 **Step 5c（M1 迁移，已完成）**：`gpu/reduce.zig` 同样迁到 runtime（`Kernels` +
 `bindAll`/`Binding` 提供两趟的 4 个 bind group，`ReduceCache` 按 device+shape 常驻；
 slice API 不变），并把 `chain_bench` 的 GEMM/reduce 设置改为直接用这两个模块的

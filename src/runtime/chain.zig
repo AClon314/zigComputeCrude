@@ -34,6 +34,7 @@ pub const Chain = struct {
     downloads: [max_downloads]PendingDownload = undefined,
     download_count: usize = 0,
     submitted: bool = false,
+    waited: bool = false,
 
     pub fn begin(ctx: *GpuContext) !Chain {
         ctx.beginErrorScope();
@@ -122,8 +123,16 @@ pub const Chain = struct {
 
     /// End the pass, copy downloads to staging, submit once, then map/copy the
     /// requested outputs.  The encoder and all staging mappings are released
-    /// before returning.
+    /// before returning.  Equivalent to `submitAsync` + `wait`.
     pub fn submit(self: *Chain) !void {
+        try self.submitAsync();
+        try self.wait();
+    }
+
+    /// Submit without waiting for the downloads.  The caller can do CPU work
+    /// (or submit more chains) before calling `wait`, which is the only step
+    /// that blocks on the GPU and maps the staging buffers.
+    pub fn submitAsync(self: *Chain) !void {
         if (self.submitted) return error.GpuError;
         self.submitted = true;
 
@@ -148,7 +157,15 @@ pub const Chain = struct {
         const encoder = self.encoder orelse return error.GpuError;
         self.encoder = null;
         try self.ctx.submitRecorded(encoder);
+    }
 
+    /// Map and copy every registered download.  Idempotent guard: calling it
+    /// twice (or before `submit*`) is an error so results cannot be silently
+    /// read from an unmapped staging buffer.
+    pub fn wait(self: *Chain) !void {
+        if (!self.submitted) return error.GpuError;
+        if (self.waited) return error.GpuError;
+        self.waited = true;
         for (self.downloads[0..self.download_count]) |item| {
             try self.ctx.readBuffer(item.buffer.staging, item.out);
             item.buffer.sync = .synced;
@@ -237,4 +254,79 @@ test "chain dispatchIndirect honours a gpu-written workgroup count" {
         const expected: u32 = if (index < 3 * 64) value else 0;
         try std.testing.expectEqual(expected, got);
     }
+}
+
+test "chain async submit overlaps cpu work and still maps the results" {
+    const gpa = std.testing.allocator;
+    const ctx = @import("../runtime.zig").open() catch |err| switch (err) {
+        error.GpuError => return error.SkipZigTest,
+    };
+
+    const add_shader = @embedFile("../gpu/shaders/add.wgsl");
+    var kernel = try Kernel.init(ctx, add_shader, "main", &.{
+        .{ .kind = .storage, .access = .read },
+        .{ .kind = .storage, .access = .read },
+        .{ .kind = .storage, .access = .write },
+    }, 64);
+    defer kernel.deinit();
+
+    const n: usize = 4096;
+    const a = try gpa.alloc(f32, n);
+    defer gpa.free(a);
+    const b = try gpa.alloc(f32, n);
+    defer gpa.free(b);
+    const out1 = try gpa.alloc(f32, n);
+    defer gpa.free(out1);
+    const out2 = try gpa.alloc(f32, n);
+    defer gpa.free(out2);
+    for (a, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 13));
+    for (b, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 7));
+
+    var a_buf = try Buffer.init(ctx, n * @sizeOf(f32), @import("buffer.zig").storage_r);
+    defer a_buf.deinit(ctx);
+    var b_buf = try Buffer.init(ctx, n * @sizeOf(f32), @import("buffer.zig").storage_r);
+    defer b_buf.deinit(ctx);
+    var out_buf1 = try Buffer.init(ctx, n * @sizeOf(f32), @import("buffer.zig").storage_rw);
+    defer out_buf1.deinit(ctx);
+    var out_buf2 = try Buffer.init(ctx, n * @sizeOf(f32), @import("buffer.zig").storage_rw);
+    defer out_buf2.deinit(ctx);
+    try a_buf.toDevice(ctx, std.mem.sliceAsBytes(a));
+    try b_buf.toDevice(ctx, std.mem.sliceAsBytes(b));
+
+    const bind1 = try kernel.createBindGroup(&.{ &a_buf, &b_buf, &out_buf1 });
+    defer @import("../runtime.zig").releaseBindGroup(bind1);
+    const bind2 = try kernel.createBindGroup(&.{ &a_buf, &b_buf, &out_buf2 });
+    defer @import("../runtime.zig").releaseBindGroup(bind2);
+
+    const grid = try kernel.gridLinear(n);
+    const sentinel: f32 = -123.0;
+    @memset(out1, sentinel);
+    @memset(out2, sentinel);
+
+    // Two chains submitted back to back; neither blocks.
+    var chain1 = try Chain.begin(ctx);
+    defer chain1.deinit();
+    try chain1.dispatch(&kernel, bind1, &.{ &a_buf, &b_buf, &out_buf1 }, grid);
+    try chain1.download(&out_buf1, std.mem.sliceAsBytes(out1));
+    try chain1.submitAsync();
+
+    var chain2 = try Chain.begin(ctx);
+    defer chain2.deinit();
+    try chain2.dispatch(&kernel, bind2, &.{ &a_buf, &b_buf, &out_buf2 }, grid);
+    try chain2.download(&out_buf2, std.mem.sliceAsBytes(out2));
+    try chain2.submitAsync();
+
+    // The readback slices are untouched until wait(): this is the CPU overlap
+    // window (here: computing the reference while the GPU is running).
+    try std.testing.expectEqual(sentinel, out1[0]);
+    try std.testing.expectEqual(sentinel, out2[n - 1]);
+
+    const expected = try gpa.alloc(f32, n);
+    defer gpa.free(expected);
+    for (expected, a, b) |*value, av, bv| value.* = av + bv;
+
+    try chain1.wait();
+    try chain2.wait();
+    try std.testing.expectEqualSlices(f32, expected, out1);
+    try std.testing.expectEqualSlices(f32, expected, out2);
 }
