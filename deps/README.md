@@ -16,9 +16,11 @@ src/gpu/webgpu.zig  ──┬── native : link libwgpu_native.so
                       └── wasm32 : 符号由 emcc --use-port=deps/emdawnwebgpu.remoteport.py 提供
 ```
 
-`tools/check_abi_drift.sh` 会逐字比对两个头文件里 compute 子集（27 个符号）的函数原型，
+`tools/check_abi_drift.sh` 会逐字比对两个头文件里 compute 子集（31 个符号）的函数原型，
 当前状态：**全部一致**（native 6766 行 / emdawn 2945 行头文件）。
-**升级任一依赖后必须重跑该脚本**，否则会出现只在单一目标上崩溃的 ABI 错位。
+该检查已接进 `zig build test`（漂移即失败；`.em-cache` 未解包时 SKIP），
+严格模式用 `zig build abi-check`。**升级任一依赖后必须重跑**，否则会出现只在单一目标上
+崩溃的 ABI 错位。
 
 ## 两端实现差异（绑定层需要绕开的）
 
@@ -40,6 +42,6 @@ curl -Lfo deps/emdawnwebgpu.remoteport.py "<EMDAWNWEBGPU_REMOTEPORT_URL>"
 rm -rf .em-cache/ports/emdawnwebgpu.remoteport*
 # 4) 触发一次 emcc 拉包 + 跑 ABI 漂移检查
 emcc --use-port=deps/emdawnwebgpu.remoteport.py:help
-tools/check_abi_drift.sh
+zig build abi-check    # 严格模式；缺输入即失败
 # 5) zig build test && zig build wasm
 ```

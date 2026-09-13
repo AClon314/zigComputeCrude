@@ -146,12 +146,22 @@ GPU 路径会正常执行。
 - staging buffer 是 `MapRead | CopyDst`，GPU output 是 `Storage | CopySrc`；readback
   后必须在 mapped range 仍有效时拷贝，随后立即 `unmap`。
 
-每次更新绑定后运行 ABI 漂移检查：
+每次更新绑定后运行 ABI 漂移检查（已接进 `zig build test`，合并后会当场拦住）：
 
 ```bash
-tools/check_abi_drift.sh
-# OK: 30 compute symbols identical
+zig build test        # 含漂移检查；.em-cache 未解包时打印 SKIP（仍退出 0）
+zig build abi-check   # 严格模式：输入缺失即失败，依赖升级/CI 用
+tools/check_abi_drift.sh            # 也可单独跑
+# [abi] OK: 31 compute symbols identical
 ```
+
+行为：
+
+- 逐字比对 native（`vendor/wgpu-native/include/webgpu/webgpu.h`）与 browser
+  （`.em-cache` 里解包的 emdawnwebgpu `webgpu.h`）的 compute 子集函数原型；
+- 任一符号缺失或签名不同 → **`zig build test` 失败**（exit 1）；
+- 两边头文件版本与 `deps/pins.env` 不一致 → 打 `WARN`（升级依赖后忘了重新解包的典型症状）；
+- 新环境没跑过 `zig build wasm`（`.em-cache` 为空）→ 打 `SKIP` 并提示生成方法，不阻塞测试。
 
 ## 浏览器 WebGPU（wasm）
 

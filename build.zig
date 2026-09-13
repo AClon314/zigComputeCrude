@@ -157,6 +157,21 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // ABI 漂移检查：native(wgpu-native) 与 browser(emdawnwebgpu) 的 webgpu.h
+    // 在 compute 子集上必须逐字一致 —— 这是「一套绑定编两个目标」的护栏，
+    // 依赖升级悄悄改签名时能当场拦住。
+    // 非严格模式：emdawn 的 webgpu.h 还没解包（没跑过 zig build wasm）时 SKIP；
+    // 要硬性检查用 `zig build abi-check`（缺输入即失败）。
+    const abi_drift = b.addSystemCommand(&.{"bash"});
+    abi_drift.addFileArg(b.path("tools/check_abi_drift.sh"));
+    test_step.dependOn(&abi_drift.step);
+
+    const abi_check_step = b.step("abi-check", "严格模式 ABI 漂移检查（缺输入即失败；依赖升级/CI 用）");
+    const abi_drift_strict = b.addSystemCommand(&.{"bash"});
+    abi_drift_strict.addFileArg(b.path("tools/check_abi_drift.sh"));
+    abi_drift_strict.setEnvironmentVariable("ABI_DRIFT_REQUIRE", "1");
+    abi_check_step.dependOn(&abi_drift_strict.step);
+
     // Browser WebGPU is a separate emcc link: the native module above must not
     // pull wgpu-native into the wasm object.
     addWasmStep(b, optimize);
