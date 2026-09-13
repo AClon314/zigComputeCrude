@@ -1,9 +1,10 @@
 # computeAccel — CPU / native + 浏览器 WebGPU 计算后端 demo
 
 一个 Zig **0.16.0** 的最小示例，演示手动或智能选择计算后端，并把
-`add` / `saxpy` 接到 GPU。CPU 后端由 `ComputeEngine(comptime BackendType)`
-静态派发；GPU 后端使用 `webgpu.h` C ABI 和 WGSL，**同一份绑定与同一份 shader
-同时编译到 native（wgpu-native）与浏览器（emdawnwebgpu/wasm）**。
+`add` / `saxpy` / `gemm` / `reduce` 接到 GPU。CPU 后端由
+`ComputeEngine(comptime BackendType)` 静态派发；GPU 后端使用 `webgpu.h` C ABI
+和 WGSL，**同一份绑定与同一份 shader 同时编译到 native（wgpu-native）与
+浏览器（emdawnwebgpu/wasm）**。
 
 ## 支持的后端
 
@@ -39,6 +40,11 @@ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json \
 zig build run -- --backend cpu_scalar --size 1048576 --iters 20
 zig build run -- --backend cpu_simd   --size 1048576 --iters 20
 zig build run -- --auto --size 1048576
+
+# GPU 新 kernel（Step 3）：GEMM 与 reduce，输出 GFLOP/s / GB/s 并与 cpu_simd 对拍
+zig build run -- --kernel gemm --m 512 --k 512 --n 512 [--variant simple|tiled|both]
+zig build run -Doptimize=ReleaseFast -- --kernel gemm --m 1024 --k 1024 --n 1024 --iters 5
+zig build run -- --kernel reduce --size 4194304 --op sum|max [--iters 10]
 ```
 
 CLI 的吞吐定义沿用原 demo：`2 * size * sizeof(f32) * iters / elapsed`，即按两个
@@ -84,15 +90,67 @@ readback，故单独列出而不掩盖端到端数字。
 GPU 测试均通过。GPU 初始化失败（没有 adapter/device）时测试返回
 `error.SkipZigTest`，而不是失败。
 
+## Step 3 新 kernel：GEMM 与 reduce（T5–T7）
+
+| kernel | shader | 说明 |
+|---|---|---|
+| GEMM simple | `src/gpu/shaders/gemm_simple.wgsl` | 每个 invocation 算一个输出元素，只用全局内存；作为正确性基线，也是“慢”的那一版 |
+| GEMM tiled | `src/gpu/shaders/gemm_tiled.wgsl` | 64 线程/workgroup，16×16 输出 tile，A/B block 进共享内存，每线程 2×2 micro-tile；边界零填充支持任意 m/k/n |
+| reduce | `src/gpu/shaders/reduce.wgsl` | 两个 entry point（`sum_main`/`max_main`）：pass 1 每个 workgroup grid-stride 归约出 partial，pass 2 用 1 个 workgroup 收尾；workgroup 内共享内存 + barrier 树形归约 |
+
+调用路径：`src/gpu/gemm.zig`、`src/gpu/reduce.zig` 各自按 `(device, shape)` 缓存
+pipeline 与 buffer；`canRun(limits, ...)` 在提交前同时检查 buffer 大小与 dispatch
+grid；`maxAbsDiff` / 参考实现对拍由测试和 CLI 共用。CLI 的每个 GPU 结果都会
+逐元素与 `cpu_simd` 参考比较并打印 `max|diff|` 与 `OK/MISMATCH`。
+
+CPU 侧对比对象是自写的 **4×8 寄存器分块 SIMD**（`referenceSimd`，比朴素 i-k-j
+SIMD 快约 4 倍），**不是 BLAS/OpenBLAS**；因此下面的对比只说明“相对本项目的
+CPU kernel”。
+
+### 本机实测（Ryzen 5 5600H + Radeon Vega iGPU，ReleaseFast）
+
+GEMM 端到端包含上传 A/B、dispatch、回读 C；`batch` 是上传一次、`iters` 次真实
+dispatch、回读一次（steady-state）。所有对拍 `max|diff| = 0`。
+
+| workload | cpu_simd | gpu_simple e2e | gpu_tiled e2e | gpu_tiled batch |
+|---|---|---|---|---|
+| 512³, iters=10 | 35.4 GFLOP/s | 71.1 (2.0x) | **164.8 (4.7x)** | 219.0 (6.2x) |
+| 1024³, iters=5 | 22.4 | 27.0 (1.2x) | **188.6 (8.4x)** | 223.7 (10.0x) |
+| 2048³, iters=3（tiled） | 12.7 | — | **212.8 (16.7x)** | 230.0 (18.1x) |
+
+reduce（GB/s 按输入字节；Debug/ReleaseFast 趋势一致，这里取 ReleaseFast）：
+
+| workload | cpu_simd | gpu e2e | gpu batch |
+|---|---|---|---|
+| 4M sum, iters=10 | 30.5 GB/s | 5.7 (0.19x) | 13.1 (0.43x) |
+| 4M max, iters=10 | 28.2 | 6.0 | 14.1 |
+| 16M sum, iters=10 | 25.8 | 7.1 (0.27x) | 25.5 (≈1.0x) |
+
+诚实结论：
+
+- **GEMM 是“计算量压过搬运量”的典型**：512³ 起 tiled 端到端就能明显胜出（4.7x），
+  2048³ 到 16.7x；simple 版只在 512³ 靠 L2 命中时勉强赢 CPU，1024³ 之后被 tiled
+  拉开，这正是共享内存分块优化的意义。
+- **reduce 在这台 iGPU 上不是 GPU 的菜**：它只是流式读，端到端输在“把整个输入写进
+  显存”这一趟（iGPU 与 CPU 共享同一块内存，等于白搬）；即使 batch（只上传一次）
+  在 16M 时也只与 CPU SIMD 打平（25.5 vs 25.8 GB/s），因为两边都到了内存带宽上限。
+  reduce 真正有价值的场景是数据本来就常驻显存（见路线图的 Step 1 链式 workload）。
+- `gpu_batch` 仍是 steady-state 观察项，不参与 `--auto` 选择，也不能和端到端数字混称。
+
 ## native WebGPU 实现
 
 ```text
 src/gpu/
   webgpu.zig        # 手写 extern C ABI；无 @cImport（native 与 wasm 共用）
-  context.zig       # instance/adapter/device/queue、ProcessEvents pump、错误域
-  pipeline.zig      # WGSL pipeline / bind group / buffer cache、dispatch、readback
+  context.zig       # instance/adapter/device/queue、ProcessEvents pump、错误域、limits、readBuffer
+  pipeline.zig      # add/saxpy：WGSL pipeline / bind group / buffer cache、dispatch、readback
+  gemm.zig          # GEMM simple/tiled：pipeline/buffer cache、canRun、CPU 参考
+  reduce.zig        # reduce sum/max：两趟归约、CPU 参考
   shaders/add.wgsl
   shaders/saxpy.wgsl
+  shaders/gemm_simple.wgsl
+  shaders/gemm_tiled.wgsl
+  shaders/reduce.wgsl
   shaders/add_source.zig   # @embedFile 桥（wasm 侧用同一份 add.wgsl）
 src/abi/wasm.zig           # wasm 入口：状态机 + ca_wasm_main/pump/status
 src/bindings/web/wasm_main.c   # C main() 引用 Zig 导出（emcc 符号保留）
@@ -112,8 +170,9 @@ queueWriteBuffer(host -> storage)
 
 pipeline、pipeline layout、bind group layout，以及当前 kernel/大小对应的 storage、
 params、staging buffer 和 bind group 都缓存在 `GpuContext` 中，不会在每次 `add`
-调用时重建 shader pipeline。越界 invocation 由 WGSL 中的 `arrayLength` 检查挡住。
-当前 GPU API 对外支持 `f32`；其它 `T` 会走正确的 CPU SIMD fallback。
+调用时重建 shader pipeline。GEMM / reduce 各自在 `gemm.zig` / `reduce.zig` 里按
+`(device, shape)` 缓存同样的资源。越界 invocation 由 WGSL 中的 `arrayLength`
+检查挡住。当前 GPU API 对外支持 `f32`；其它 `T` 会走正确的 CPU SIMD fallback。
 
 ### 限制与已知边界
 
@@ -141,6 +200,14 @@ GPU 路径会正常执行。
   `WGPUCallbackMode_AllowProcessEvents`，由 `wgpuInstanceProcessEvents(instance)`
   循环推进；**不调用也不暴露 `wgpuInstanceWaitAny`**。
 - 不使用 `wgpuDevicePoll`，shader 只用 WGSL，不传 SPIR-V。
+- readback 的等待**不能用固定的 ProcessEvents 次数当超时**：需要的泵数与排队中的
+  GPU 工作成正比（实测 1024³ 的 5 连发 GEMM 批处理让一次 4MB map 超过 10 万次
+  `wgpuInstanceProcessEvents`），固定次数会在设备仍忙时提前到期；而带 pending
+  mapping 的 buffer 再进 `wgpuQueueSubmit` 会触发 wgpu-native 的**致命** validation
+  error（`Buffer ... is still mapped`，直接 abort，error scope 捕不到）。现在
+  `GpuContext.waitFor` 用 30s 墙钟预算，超时会 `wgpuBufferUnmap` 取消挂起的映射；
+  `add` 与 `gemm`/`reduce` 两条 readback 路径都已覆盖（回归测试
+  `gemm batched long gpu work does not expire the readback wait`）。
 - C 的 `WGPU_*_INIT` 宏不能在 Zig 中直接使用；WGSL descriptor 的 chain 手写为
   `.sType = WGPUSType_ShaderSourceWGSL`。
 - staging buffer 是 `MapRead | CopyDst`，GPU output 是 `Storage | CopySrc`；readback

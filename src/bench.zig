@@ -3,6 +3,8 @@ const backend = @import("backend.zig");
 const engine = @import("engine.zig");
 const gpu_context = @import("gpu/context.zig");
 const gpu_pipeline = @import("gpu/pipeline.zig");
+const gpu_gemm = @import("gpu/gemm.zig");
+const gpu_reduce = @import("gpu/reduce.zig");
 const BackendType = backend.BackendType;
 const ComputeEngine = engine.ComputeEngine;
 
@@ -44,6 +46,110 @@ pub fn timeGpuAdd(out: []f32, a: []const f32, b: []const f32, iters: usize) !u64
 pub fn timeGpuAddBatched(out: []f32, a: []const f32, b: []const f32, iters: usize) !u64 {
     const t0 = nowNs();
     try gpu_pipeline.addBatched(out, a, b, iters);
+    const t1 = nowNs();
+    return @intCast(@max(0, t1 - t0));
+}
+
+/// End-to-end CPU GEMM: `iters` full reference passes, no GPU involved.
+pub fn timeGemmCpu(
+    comptime use_simd: bool,
+    m: usize,
+    k: usize,
+    n: usize,
+    a: []const f32,
+    b: []const f32,
+    out: []f32,
+    iters: usize,
+) u64 {
+    const t0 = nowNs();
+    for (0..iters) |_| {
+        if (use_simd) {
+            gpu_gemm.referenceSimd(m, k, n, a, b, out);
+        } else {
+            gpu_gemm.referenceScalar(m, k, n, a, b, out);
+        }
+    }
+    const t1 = nowNs();
+    return @intCast(@max(0, t1 - t0));
+}
+
+/// End-to-end GPU GEMM: every iteration uploads A/B, dispatches, reads C back.
+/// GPU errors propagate; the caller must not substitute CPU time.
+pub fn timeGemm(
+    variant: gpu_gemm.Variant,
+    m: usize,
+    k: usize,
+    n: usize,
+    a: []const f32,
+    b: []const f32,
+    out: []f32,
+    iters: usize,
+) !u64 {
+    const t0 = nowNs();
+    for (0..iters) |_| try gpu_gemm.gemm(variant, m, k, n, a, b, out);
+    const t1 = nowNs();
+    return @intCast(@max(0, t1 - t0));
+}
+
+/// Steady-state GPU GEMM: upload A/B once, run `iters` dispatches, read C once.
+pub fn timeGemmBatched(
+    variant: gpu_gemm.Variant,
+    m: usize,
+    k: usize,
+    n: usize,
+    a: []const f32,
+    b: []const f32,
+    out: []f32,
+    iters: usize,
+) !u64 {
+    const t0 = nowNs();
+    try gpu_gemm.gemmBatched(variant, m, k, n, a, b, out, iters);
+    const t1 = nowNs();
+    return @intCast(@max(0, t1 - t0));
+}
+
+pub fn timeReduceCpu(
+    comptime use_simd: bool,
+    op: gpu_reduce.Op,
+    out: *f32,
+    input: []f32,
+    iters: usize,
+) u64 {
+    const t0 = nowNs();
+    for (0..iters) |iter| {
+        // Bump one element per iteration: a pure reduction of a loop-invariant
+        // slice is hoisted out of the loop by the optimizer in ReleaseFast, so
+        // without this the benchmark would measure one reduction, not `iters`.
+        input[iter % input.len] += 1.0;
+        out.* = switch (op) {
+            .sum => if (use_simd) gpu_reduce.referenceSumSimd(input) else gpu_reduce.referenceSum(input),
+            .max => if (use_simd) gpu_reduce.referenceMaxSimd(input) else gpu_reduce.referenceMax(input),
+        };
+        std.mem.doNotOptimizeAway(out.*);
+    }
+    const t1 = nowNs();
+    return @intCast(@max(0, t1 - t0));
+}
+
+/// End-to-end GPU reduce: each iteration uploads the input, runs both passes
+/// and reads the 4-byte result back.
+pub fn timeReduce(op: gpu_reduce.Op, out: *f32, input: []const f32, iters: usize) !u64 {
+    const t0 = nowNs();
+    for (0..iters) |_| try gpu_reduce.reduce(op, out, input);
+    const t1 = nowNs();
+    return @intCast(@max(0, t1 - t0));
+}
+
+/// Steady-state GPU reduce: upload once, run `iters` two-pass reductions,
+/// read the result once.
+pub fn timeReduceBatched(
+    op: gpu_reduce.Op,
+    out: *f32,
+    input: []const f32,
+    iters: usize,
+) !u64 {
+    const t0 = nowNs();
+    try gpu_reduce.reduceBatched(op, out, input, iters);
     const t1 = nowNs();
     return @intCast(@max(0, t1 - t0));
 }

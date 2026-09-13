@@ -397,7 +397,9 @@ pub fn addBatched(out: []f32, a: []const f32, b: []const f32, iters: usize) !voi
 }
 
 // Kept in this module so map callback setup cannot accidentally be changed to
-// a wait-any-based implementation.
+// a wait-any-based implementation.  On a wait timeout the pending mapping is
+// cancelled before returning: a mapping left in `Waiting` would make the next
+// `wgpuQueueSubmit` fail with a fatal "buffer is still mapped" validation error.
 fn mapRead(self: *GpuContext, buffer: wgpu.WGPUBuffer, byte_size: usize) !void {
     var state = context_mod.MapState{};
     _ = wgpu.wgpuBufferMapAsync(buffer, wgpu.WGPUMapMode_Read, 0, byte_size, .{
@@ -407,6 +409,9 @@ fn mapRead(self: *GpuContext, buffer: wgpu.WGPUBuffer, byte_size: usize) !void {
         .userdata1 = @ptrCast(&state),
         .userdata2 = null,
     });
-    try self.waitFor(&state);
+    self.waitFor(&state) catch |err| {
+        wgpu.wgpuBufferUnmap(buffer);
+        return err;
+    };
     if (state.status != wgpu.WGPUMapAsyncStatus_Success) return error.GpuError;
 }

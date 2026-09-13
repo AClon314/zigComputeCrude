@@ -5,6 +5,17 @@ const wgpu = @import("webgpu.zig");
 /// the public engine API can then fall back to a CPU implementation.
 pub const GpuError = error{GpuError};
 
+/// Wall-clock budget for one async callback (adapter/device/map/error-scope).
+/// It only guards against a genuinely stuck device; it is not an estimate of
+/// how long queued GPU work may take.
+const wait_timeout_ns: i128 = 30 * 1_000_000_000;
+
+fn nowNs() i128 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
+}
+
 /// The subset of device limits needed by the compute backend.  A dispatch is
 /// laid out as a 2D grid, so both axes must fit
 /// `maxComputeWorkgroupsPerDimension`; each storage/staging allocation must fit
@@ -22,15 +33,34 @@ pub const GpuLimits = struct {
         {
             return false;
         }
+        return self.workgroupGrid(groups) != null;
+    }
 
+    /// Flatten a linear workgroup count into the 2D grid used by every dispatch.
+    /// WebGPU limits each axis independently, so the kernel reconstructs the
+    /// linear index from `global_invocation_id` and `num_workgroups`.  Returns
+    /// null when even the flattened grid cannot fit the device limit.
+    pub fn workgroupGrid(self: GpuLimits, groups: usize) ?WorkgroupGrid {
+        if (groups == 0) return null;
         const max_dimension: u64 = self.maxComputeWorkgroupsPerDimension;
-        if (max_dimension == 0) return false;
+        if (max_dimension == 0) return null;
+
         const group_count: u64 = @intCast(groups);
         const x = @min(group_count, max_dimension);
         // x is non-zero because groups and max_dimension were checked above.
         const y = (group_count - 1) / x + 1;
-        return y <= max_dimension;
+        if (y > max_dimension) return null;
+
+        return .{
+            .x = @intCast(x),
+            .y = @intCast(y),
+        };
     }
+};
+
+pub const WorkgroupGrid = struct {
+    x: u32,
+    y: u32,
 };
 
 /// Why the one-time capability probe failed.  The enum is intentionally more
@@ -370,16 +400,61 @@ pub const GpuContext = struct {
         if (self.instance) |instance| wgpu.wgpuInstanceProcessEvents(instance);
     }
 
+    /// Wait for an async callback with a wall-clock budget.
+    ///
+    /// A fixed iteration count is the wrong unit here: the number of
+    /// ProcessEvents calls needed is proportional to the GPU work queued
+    /// before the callback (a 5-dispatch GEMM batch on the iGPU needs far more
+    /// than an add), so a constant cap silently expires while the device is
+    /// still busy.  The budget below is a real timeout, not a work estimate.
     fn waitForInitialization(self: *GpuContext, state: anytype) error{InitializationTimeout}!void {
-        var attempts: usize = 0;
-        while (!state.done and attempts < 100_000) : (attempts += 1) self.pump();
-        if (!state.done) return error.InitializationTimeout;
+        const start = nowNs();
+        while (!state.done) {
+            self.pump();
+            if (nowNs() - start > wait_timeout_ns) return error.InitializationTimeout;
+        }
     }
 
     pub fn waitFor(self: *GpuContext, state: anytype) !void {
-        var attempts: usize = 0;
-        while (!state.done and attempts < 100_000) : (attempts += 1) self.pump();
-        if (!state.done) return error.GpuError;
+        const start = nowNs();
+        while (!state.done) {
+            self.pump();
+            if (nowNs() - start > wait_timeout_ns) return error.GpuError;
+        }
+    }
+
+    /// Map a MapRead buffer with ProcessEvents only, copy its bytes into
+    /// `out`, and unmap before returning.  No WaitAny/device-poll path is
+    /// involved; gemm/reduce reuse this so readback cannot drift per kernel.
+    ///
+    /// If the wait times out, the pending mapping is aborted with
+    /// `wgpuBufferUnmap` so the buffer returns to `Idle`; otherwise a later
+    /// `wgpuQueueSubmit` would fail validation with "buffer is still mapped"
+    /// (a fatal error in wgpu-native, not a catchable one).
+    pub fn readBuffer(self: *GpuContext, buffer: wgpu.WGPUBuffer, out: []u8) !void {
+        if (out.len == 0) return;
+        var state = MapState{};
+        _ = wgpu.wgpuBufferMapAsync(buffer, wgpu.WGPUMapMode_Read, 0, out.len, .{
+            .nextInChain = null,
+            .mode = wgpu.WGPUCallbackMode_AllowProcessEvents,
+            .callback = mapCallback,
+            .userdata1 = @ptrCast(&state),
+            .userdata2 = null,
+        });
+        self.waitFor(&state) catch |err| {
+            // Cancel a mapping stuck in `Waiting` so the buffer can be reused.
+            wgpu.wgpuBufferUnmap(buffer);
+            return err;
+        };
+        if (state.status != wgpu.WGPUMapAsyncStatus_Success) return error.GpuError;
+
+        const mapped = wgpu.wgpuBufferGetMappedRange(buffer, 0, out.len) orelse {
+            wgpu.wgpuBufferUnmap(buffer);
+            return error.GpuError;
+        };
+        defer wgpu.wgpuBufferUnmap(buffer);
+        const mapped_bytes = @as([*]const u8, @ptrCast(mapped))[0..out.len];
+        @memcpy(out, mapped_bytes);
     }
 
     pub fn beginErrorScope(self: *GpuContext) void {
