@@ -1,106 +1,117 @@
-# handoff — T1：computeAccel 原生 WebGPU 后端（wgpu-native）
+# handoff — T2：computeAccel 浏览器（wasm）WebGPU 后端（emdawnwebgpu）
 
-> 本文件是**当前任务**的交接文档。上游研究结论见 `docs/gpu-backend-research.md`；依赖见 `deps/README.md`。
-> 规划中的后续任务：T2 = browser/wasm 后端（emdawnwebgpu），T3 = 能力探测 + 回退 + bench 集成。**本任务只做 T1。**
+> 本文件是**当前任务**的交接文档。T1（native wgpu-native 后端）已完成并提交（`456e327`），
+> 其任务文档见 `git show 1cb446c:handoff.md`；上游研究见 `docs/gpu-backend-research.md`；
+> 依赖见 `deps/README.md`。后续任务：T3 = 能力探测 + 回退 + bench 集成。
 
 ## 0. 一句话
 
-用 wgpu-native 的 C ABI 在 Zig 里实现 `gpu_webgpu` 后端，让
-`ComputeEngine(.gpu_webgpu).add/saxpy` 在本机 GPU 上跑出与 `cpu_simd` **逐元素一致**的结果，
-并打印实测吞吐。**不引入任何第三方 Zig 包**，绑定自己写。
+让 `gpu_webgpu` 后端**再编译出一个 wasm 目标**，在浏览器里跑通同一套 WGSL kernel，
+页面自证「GPU 结果 == CPU 结果」。**复用 T1 的 `src/gpu/webgpu.zig` 绑定，不许 fork 一份。**
 
-## 1. 环境事实（已实测确认，不要再怀疑）
+## 1. 关键原理（设计基石，别绕开）
 
-| 项 | 值 |
+native 与 browser 两个实现提供**同一份 `webgpu.h` C ABI**：
+
+```
+src/gpu/webgpu.zig ──┬── native  : link libwgpu_native.so          （T1 已通）
+                     └── wasm32  : 符号由 emcc --use-port=… 提供     （本任务）
+```
+
+`tools/check_abi_drift.sh` 已验证两端 compute 子集 27 个符号原型逐字一致（含 `wgpuInstanceProcessEvents`）。
+所以 **T2 原则上不需要改 `src/gpu/*.zig` 的绑定与逻辑**，只需要：
+
+1. `build.zig` 加 wasm 目标（照 ouo 的 `addWasmStep` 抄）
+2. 新增 wasm 入口 + shell.html + JS 驱动
+3. 处理少数平台差异（见 §3）
+
+## 2. 参照实现（ouo 已跑通，直接读这三份文件）
+
+| 文件 | 读什么 |
 |---|---|
-| Zig | `0.16.0`（pixi global，`zig version` 可验） |
-| 依赖 | `vendor/wgpu-native/`（v29.0.1.1 预编译，`tools/fetch_deps.sh` 已拉过） |
-| 头文件 | `vendor/wgpu-native/include/webgpu/webgpu.h`（6766 行）+ `webgpu.h`(同目录 `wgpu.h` 是 native 私有扩展) |
-| 库 | `vendor/wgpu-native/lib/libwgpu_native.so`（9.3MB）+ `libwgpu_native.a` |
-| 本机 GPU | AMD Radeon Vega iGPU（radv/Vulkan）+ NVIDIA RTX 3050 Mobile；`vulkaninfo` 可用 |
-| 已跑通的 C 探针 | `wgpuCreateInstance` → `wgpuInstanceRequestAdapter` → `wgpuAdapterRequestDevice` → `wgpuDeviceGetQueue` → `wgpuDeviceCreateBuffer` **全部返回非空**；`wgpuAdapterGetInfo` 报 `backendType=Vulkan(6), vendorID=0x1002(AMD)` |
+| `/home/n/document/code/ouo/build.zig` 的 `addWasmStep` | Zig 编 `wasm32-freestanding` 对象 → emcc 链接 → 安装到 `zig-out/webgpu/` |
+| `/home/n/document/code/ouo/src/abi/wasm.zig` | wasm 入口写法（只有 `extern` 声明，无 `@cImport`） |
+| `/home/n/document/code/ouo/src/bindings/web/shell.html` | 平台闸门（Firefox 非 Windows 必须跳过）、`Module` 配置、启动流程 |
+| `/home/n/document/code/ouo/src/bindings/web/wasm_main.c` | C `main()` 引用 Zig 导出（规避 emcc `EXPORTED_FUNCTIONS` 符号匹配坑） |
 
-C 探针用的调用姿势（**照抄这个模式**，本任务就是用 Zig 复刻它）：
-
-```c
-wgpuInstanceRequestAdapter(inst, NULL,
-    (WGPURequestAdapterCallbackInfo){ .mode = WGPUCallbackMode_AllowProcessEvents,
-                                      .callback = on_adapter, .userdata1 = &adapter });
-for (int i = 0; i < 200 && !adapter; i++) wgpuInstanceProcessEvents(inst);   // ← 轮询泵
-```
-
-## 2. 硬性约束（踩过的坑，别踩回去）
-
-1. **绝对不要调用 `wgpuInstanceWaitAny`**。
-   - native：wgpu-native v29 里它是 `src/unimplemented.rs` 里的 `unimplemented!()` → Rust panic → `abort()`。**我实测崩了**。
-   - browser（T2）：emdawnwebgpu 无 ASYNCIFY 时同样 `abort('TODO: Implement asyncify-free WaitAny for timeout=0')`。
-   - 唯一两端通用的推进方式：回调用 `WGPUCallbackMode_AllowProcessEvents` + 循环 `wgpuInstanceProcessEvents(instance)`。
-   - 绑定层统一暴露 `pump()`（内部就是 ProcessEvents 循环），**不要**把 waitAny 暴露给上层。
-2. **不要用 `wgpuDevicePoll`**（emdawnwebgpu 里没有这个符号，用了绑定层就不通用了）。
-3. **shader 只用 WGSL**。浏览器端 Dawn 明确拒绝 SPIR-V（`"ShaderSourceSPIRV requested, but not supported in Wasm"`）。native 想用 SPIR-V 是以后的事。
-4. 回调必须是 `callconv(.c)`，**上下文只能经 `userdata1` 传**（Zig 闭包不能转函数指针）。
-5. C 的 `WGPU_*_INIT` 宏在 Zig 里不可用 → 手写 `.{ .chain = .{ .sType = WGPUSType_ShaderSourceWGSL } }`。`sType` 填错是运行时报错的头号来源。
-6. Zig 0.16 的 std API 与老教程差别大（没有 `argsAlloc`、没有 `fs.cwd()`、`ArrayList` 没有 `.writer()`）。参考同仓库现有代码与 `build.zig` 的写法。
-
-## 3. 交付物
+ouo 的 emcc 参数（我们**去掉 `-sUSE_SDL=3`**，compute 不需要窗口/SDL）：
 
 ```
-src/gpu/
-  webgpu.zig        # 最小绑定：~30 个 extern fn + 需要的 extern struct/enum。纯声明，无 @cImport。
-  context.zig       # GpuContext：instance/adapter/device/queue 生命周期 + pump() + 错误域
-  pipeline.zig      # shader module / compute pipeline / bind group 缓存 + dispatch + readback
-  shaders/add.wgsl  # @embedFile 用
-  shaders/saxpy.wgsl
+emcc --use-port=deps/emdawnwebgpu.remoteport.py \
+     -sALLOW_MEMORY_GROWTH=1 --closure=1 -O3 -o <out>.js \
+     <zig_obj.o> src/bindings/web/wasm_main.c
 ```
-改动：
-- `src/engine.zig`：`.gpu_webgpu` 分支接上（`add` / `saxpy`），**不要再 panic**
-- `src/backend.zig`：`gpu_webgpu` 的 `isImplemented()` 视情况调整（若做成运行时探测，保持 `false` 也行，见下）
-- `build.zig`：native 目标链接 `vendor/wgpu-native/lib/libwgpu_native.so`，并让运行时能找到它（`addLibraryPath` + `linkSystemLibrary("wgpu_native")`；运行时用 rpath 或把 `.so` 安装到 `zig-out/lib` 并设 rpath `$ORIGIN/../lib`）
-- `README.md`：更新「支持的后端」表 + GPU 运行/验证方法 + 踩坑
+且 `EM_CACHE=<project>/.em-cache`（必须设，否则每次重下 port）。
 
-## 4. 绑定清单（照这个写，不要多写）
+## 3. 硬性约束（两端差异，必须遵守）
 
-**符号**（全部在 `webgpu.h` 里；已用 `tools/check_abi_drift.sh` 验证 native 与 browser 原型逐字一致）：
-`wgpuCreateInstance`、`wgpuInstanceProcessEvents`、`wgpuInstanceRequestAdapter`、`wgpuAdapterRequestDevice`、`wgpuAdapterGetInfo`、`wgpuDeviceGetQueue`、`wgpuDevicePushErrorScope`、`wgpuDevicePopErrorScope`、`wgpuDeviceCreateShaderModule`、`wgpuDeviceCreateComputePipeline`、`wgpuComputePipelineGetBindGroupLayout`、`wgpuDeviceCreateBindGroupLayout`、`wgpuDeviceCreateBindGroup`、`wgpuDeviceCreatePipelineLayout`(可省)、`wgpuDeviceCreateCommandEncoder`、`wgpuCommandEncoderBeginComputePass`、`wgpuCommandEncoderFinish`、`wgpuComputePassEncoderSetPipeline`、`wgpuComputePassEncoderSetBindGroup`、`wgpuComputePassEncoderDispatchWorkgroups`、`wgpuComputePassEncoderEnd`、`wgpuDeviceCreateBuffer`、`wgpuQueueWriteBuffer`、`wgpuQueueSubmit`、`wgpuBufferMapAsync`、`wgpuBufferGetMappedRange`、`wgpuBufferUnmap`，外加对应的 `*Release`（instance/adapter/device/queue/buffer/shaderModule/pipeline/bindGroup/bindGroupLayout/commandEncoder/computePassEncoder/commandBuffer）。
+1. **不要用 `wgpuInstanceWaitAny`**：浏览器端无 ASYNCIFY 时直接 `abort()`（我已在更新后的
+   emdawnwebgpu v20260911 源码里复核：`library_webgpu.js:740`）。统一用 `AllowProcessEvents` 回调 + `wgpuInstanceProcessEvents` 轮询泵——**T1 已经就是这么写的，沿用即可**。
+2. **不要开 `-sASYNCIFY`**（体积/性能代价大且我们不需要）。
+3. **shader 只能 WGSL**：浏览器端明确拒绝 SPIR-V（`webgpu.cpp:1670`），沿用 T1 的 `src/gpu/shaders/*.wgsl`。
+4. **不要用 `wgpuDevicePoll`**（emdawnwebgpu 没有该符号）。
+5. wasm 目标**不能** link `wgpu_native`（`build.zig` 必须按 target 分支；emcc 侧提供符号）。
+6. 回调 `callconv(.c)` + `userdata1` 传上下文；`WGPU_*_INIT` 宏不可用，手写 `.chain = .{ .sType = … }`。
+7. 浏览器里 **buffer size 必须是 4 的倍数**，`mapAsync` 的 offset/size 有对齐要求。
+8. `navigator.gpu` 是 `[SecureContext]`：需要 **https 或 localhost**。
+9. Firefox 在 Linux 上不支持 WebGPU 且会拖垮浏览器 → **照抄 ouo shell.html 的 UA 闸门**，
+   不支持时显示提示而不是崩溃。
 
-**枚举/常量**：`WGPUBufferUsage_Storage|CopyDst|CopySrc|MapRead`、`WGPUMapMode_Read`、`WGPUShaderStage_Compute`、`WGPUCallbackMode_AllowProcessEvents`、`WGPU_STRLEN`、`WGPU_WHOLE_SIZE`。
-**结构体**：`WGPUStringView{data,length}`、`WGPUChainedStruct`、`WGPURequestAdapterCallbackInfo`、`WGPURequestDeviceCallbackInfo`、`WGPUBufferMapCallbackInfo`、`WGPUBufferDescriptor`、`WGPUShaderModuleDescriptor`+`WGPUShaderSourceWGSL`、`WGPUComputePipelineDescriptor`+`WGPUComputeState`、`WGPUBindGroupLayoutDescriptor`+`...Entry`、`WGPUBindGroupDescriptor`+`...Entry`、`WGPUCommandEncoderDescriptor`、`WGPUComputePassDescriptor`。
+## 4. 交付物
 
-> 字段的**顺序和类型必须与 C 头文件完全一致**（extern struct）。写的时候逐字段核对头文件，不要凭记忆。
+```
+src/abi/wasm.zig                    # wasm 入口：export fn ca_wasm_main() 等
+src/bindings/web/wasm_main.c        # C main() → 调用 Zig 导出
+src/bindings/web/shell.html         # 平台闸门 + 结果展示 + 驱动 JS
+build.zig                           # 新增 wasm step（-Dtarget 分支，不影响 native）
+README.md                           # 浏览器构建/运行/验证说明
+```
 
-## 5. 实现要点
+建议的导出面（越小越好）：
 
-- **数据流**：`Upload(host→device storage buffer)` → `dispatch(workgroups)` → `submit` → `copy result buffer → staging(MapRead)` → `mapAsync` → `pump` → `getMappedRange` → 拷贝出来 → `unmap`。
-- **pipeline/bind group 缓存**：不要每次 `add` 都重建 pipeline（那会把 GPU 优势吃光）；按 (kernel, buffer 数量/大小) 缓存在 GpuContext 里。
-- **dispatch 尺寸**：`workgroup_size(64)`，`workgroupCountX = ceil(n/64)`；最后一次 dispatch 越界的线程必须在 shader 里用 `if (gid >= n) { return; }` 挡住。
-- **readback 之后必须 `unmap`**，且 `getMappedRange` 指针只在 map..unmap 之间有效。
-- **错误处理**：至少接上 `wgpuDevicePushErrorScope`/`PopErrorScope` 或 device uncaptured error 回调，把失败变成 `error.GpuError` 而不是静默错误结果。
-- **失败要能回退**：`GpuContext.init()` 任何一步失败（无 GPU / 无 adapter / device 创建失败）都返回错误，调用侧回退 CPU。
+```
+ca_wasm_main() -> void              # C main 调用；建 context、跑自证、写结果到状态字符串
+ca_wasm_status() -> [*:0]const u8   # 页面轮询/读取的状态文本（"loading" / "GPU add: MATCH (...)" / 错误）
+```
+也可以让 Zig 调 JS（`extern fn ca_js_report(ptr, len)`），但**先做最简单能验证的路径**。
 
-## 6. 验收标准（必须自己实测，把输出贴进 commit message）
+### 自证逻辑（这是本任务的核心验收，不能省）
 
-1. `zig build test` 全绿（CPU 测试行为不变）。
-2. 新增 GPU 测试：`size = 1<<20` 的 `add` 结果与 `cpu_scalar`/`cpu_simd` **逐元素一致**（`expectEqualSlices`）；`saxpy` 同理。
-3. `zig build run -- --backend gpu_webgpu --size 1048576 --iters 20` 能跑出正确结果（不再 panic）。
-4. 打印实测吞吐（GB/s）与 `cpu_simd` 对比，并把数字写进 README / commit message。
-   - 注意：**小数组 GPU 更慢是正常的**（传输+提交开销），不要为了"看起来快"去调参数；大数组（≥1<<20）应能看到 GPU 优势。
-5. GPU 不可用时测试要 **skip 而不是 fail**（本机有 GPU，但 CI/他人机器可能没有）。
-6. 完成后 `git commit`（中文提交信息，说明改动 + 实测数据）。
+页面里必须**同时**跑 CPU 与 GPU 的 `add`（size 建议 `1<<20`），逐元素比较后把结论写到状态文本：
 
-## 7. 不要做
+```
+"GPU add: MATCH (n=1048576, gpu=xx ms, cpu_simd=yy ms)"
+"GPU add: MISMATCH at i=..." 
+```
+纯打印"跑起来了"不算通过。
 
-- 不要改 `cpu_scalar` / `cpu_simd` 的行为、阈值或测试。
-- 不要动 wasm/browser 相关（T2 的任务）：不要动 `deps/`、`.em-cache`、emcc 相关。
-- 不要引入第三方 Zig 依赖包（`build.zig.zon` 的 dependencies 保持为空）。
-- 不要用 `wgpuInstanceWaitAny` / `wgpuDevicePoll` / SPIR-V。
+## 5. 验收标准（必须自己实测 + 贴证据）
 
-## 8. 有用的命令
+1. `zig build test` 仍全绿（native 不受影响，8/8）。
+2. `zig build wasm` 成功，产出 `zig-out/webgpu/{*.js,*.wasm,shell.html}`（列出实际文件名与体积）。
+3. 浏览器端自证通过：**最好用 `agent-browser` 打开页面抓状态文本**；若环境不允许（headless Chrome
+   的 WebGPU 可能不可用），明确写出「需用户手动用 Chrome 打开 https://localhost:PORT/shell.html」，
+   并说明你**已经验证到什么程度**（例如：wasm 能实例化、能建 device、能 dispatch——用 JS console 输出证明）。
+4. 说明如何起服务（`python3 -m http.server` 在 127.0.0.1 也算 secure context；若用 https 见 ouo 的
+   `bunx serve` + mkcert 方案）。
+5. `git commit`（中文提交信息，含实测证据）。
+
+> 诚实要求：如果浏览器端某步没跑通，**不要伪造**。写清卡在哪、错误信息、下一步猜想。
+
+## 6. 不要做
+
+- 不要改 `src/gpu/webgpu.zig` / `context.zig` / `pipeline.zig` 的**绑定与语义**（除非发现真正的平台差异，
+  那时要在代码注释里写清"native/browser 差异"）。
+- 不要改 CPU 后端与已有 native 测试的判定。
+- 不要动 `deps/`（依赖已 pin 到最新 v20260911.162847）、不要动 `.em-cache`（已 gitignore）。
+- 不要引入第三方 Zig 依赖。
+
+## 7. 有用命令
 
 ```bash
-zig version                                   # 0.16.0
-tools/fetch_deps.sh                           # 依赖（已拉过，幂等）
-tools/check_abi_drift.sh                      # ABI 漂移检查（改完绑定跑一次）
-zig build test                                # 单元测试
-zig build run -- --backend gpu_webgpu --size 1048576 --iters 20
-VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json zig build run ...   # 指定走 AMD
+zig version                    # 0.16.0
+emcc --version                 # 6.0.9-git（pixi global wasm 环境）
+ls .em-cache/ports/            # emdawnwebgpu.remoteport 已下载好（v20260911）
+zig build test && zig build wasm
+python3 -m http.server 8080    # 在 zig-out/webgpu/ 下起（localhost = secure context）
 ```
