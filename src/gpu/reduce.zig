@@ -116,7 +116,7 @@ fn emptyStringView() wgpu.WGPUStringView {
 /// Number of pass-1 workgroups: one per 64 elements, capped at the device's
 /// per-dimension dispatch limit.  Each workgroup then handles several
 /// 64-element strides via the shader's grid-stride loop.
-fn bucketCount(limits: context_mod.GpuLimits, n: usize) usize {
+pub fn bucketCount(limits: context_mod.GpuLimits, n: usize) usize {
     const raw = (n + workgroup_size - 1) / workgroup_size;
     const max_dim: usize = limits.maxComputeWorkgroupsPerDimension;
     return @min(raw, max_dim);

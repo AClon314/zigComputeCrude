@@ -555,6 +555,23 @@ pub const GpuContext = struct {
         wgpu.wgpuCommandBufferRelease(command_buffer);
     }
 
+    /// One-off device-to-device copy followed by a submit; used by blocking
+    /// readbacks that are not part of a `Chain`.
+    pub fn copyBufferToStaging(
+        self: *GpuContext,
+        src: wgpu.WGPUBuffer,
+        dst: wgpu.WGPUBuffer,
+        byte_size: usize,
+    ) !void {
+        self.beginErrorScope();
+        const encoder = wgpu.wgpuDeviceCreateCommandEncoder(self.device, null) orelse {
+            self.discardErrorScope();
+            return error.GpuError;
+        };
+        wgpu.wgpuCommandEncoderCopyBufferToBuffer(encoder, src, 0, dst, 0, @intCast(byte_size));
+        try self.submitRecorded(encoder);
+    }
+
     pub fn beginErrorScope(self: *GpuContext) void {
         wgpu.wgpuDevicePushErrorScope(self.device, wgpu.WGPUErrorFilter_Validation);
     }
@@ -661,7 +678,9 @@ pub const GpuContext = struct {
     }
 };
 
-fn emptyStringView() wgpu.WGPUStringView {
+/// Public so kernel/buffer modules can build descriptors without duplicating
+/// the empty-label convention.
+pub fn emptyStringView() wgpu.WGPUStringView {
     return .{ .data = null, .length = wgpu.WGPU_STRLEN };
 }
 

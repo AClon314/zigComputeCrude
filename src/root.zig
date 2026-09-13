@@ -7,6 +7,8 @@ const bench_mod = @import("bench.zig");
 const gpu_context = @import("gpu/context.zig");
 const gpu_pipeline = @import("gpu/pipeline.zig");
 const gpu_gemm = @import("gpu/gemm.zig");
+const runtime_mod = @import("runtime.zig");
+const chain_bench_mod = @import("chain_bench.zig");
 const gpu_reduce = @import("gpu/reduce.zig");
 
 pub const BackendType = backend.BackendType;
@@ -15,6 +17,8 @@ pub const DeviceBuffer = buffer.DeviceBuffer;
 pub const ComputeEngine = engine.ComputeEngine;
 pub const bench = bench_mod;
 pub const gpu = gpu_pipeline;
+pub const runtime = runtime_mod;
+pub const chain_bench = chain_bench_mod;
 pub const gemm = gpu_gemm;
 pub const reduce = gpu_reduce;
 pub const GpuContext = gpu_context.GpuContext;
@@ -53,6 +57,8 @@ test {
     _ = gpu_pipeline;
     _ = gpu_gemm;
     _ = gpu_reduce;
+    _ = runtime_mod;
+    _ = chain_bench_mod;
 }
 
 // ===== 关键 test：性能对比（scalar vs simd）=====

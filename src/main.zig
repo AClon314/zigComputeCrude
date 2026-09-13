@@ -11,9 +11,27 @@ const default_gemm_dim: usize = 512;
 const default_gemm_iters: usize = 5;
 const default_reduce_size: usize = 1 << 22;
 const default_reduce_iters: usize = 10;
+const default_chain_iters: usize = 3;
 
-const Kernel = enum { add, gemm, reduce };
+const Kernel = enum { add, gemm, reduce, chain };
 const VariantChoice = enum { simple, tiled, both };
+const ChainKind = enum {
+    saxpy,
+    pipeline,
+
+    fn name(self: ChainKind) []const u8 {
+        return switch (self) {
+            .saxpy => "saxpy",
+            .pipeline => "gemm+bias+reduce",
+        };
+    }
+};
+
+fn parseChainKind(name: []const u8) ?ChainKind {
+    if (std.mem.eql(u8, name, "saxpy")) return .saxpy;
+    if (std.mem.eql(u8, name, "pipeline")) return .pipeline;
+    return null;
+}
 
 fn parseBackend(name: []const u8) ?BackendType {
     if (std.mem.eql(u8, name, "cpu_scalar")) return .cpu_scalar;
@@ -27,6 +45,7 @@ fn parseKernel(name: []const u8) ?Kernel {
     if (std.mem.eql(u8, name, "add")) return .add;
     if (std.mem.eql(u8, name, "gemm")) return .gemm;
     if (std.mem.eql(u8, name, "reduce")) return .reduce;
+    if (std.mem.eql(u8, name, "chain")) return .chain;
     return null;
 }
 
@@ -112,6 +131,7 @@ fn printUsage(writer: *Io.Writer) !void {
         "usage: computeAccel [--backend <name> | --auto | --heuristic] [--size <n>] [--iters <n>]\n" ++
             "       computeAccel --kernel gemm [--m <n>] [--k <n>] [--n <n>] [--variant simple|tiled|both] [--iters <n>]\n" ++
             "       computeAccel --kernel reduce [--size <n>] [--op sum|max] [--iters <n>]\n" ++
+            "       computeAccel --kernel chain [--chain saxpy|pipeline] [--chain-lens 1,4,16,64] [--size <n>] [--iters <n>]\n" ++
             "   --kernel add is the default; --backend/--auto/--heuristic only apply to it.\n",
         .{},
     );
@@ -156,6 +176,8 @@ pub fn main(init: std.process.Init) !void {
     var n: usize = default_gemm_dim;
     var variant_choice: VariantChoice = .both;
     var reduce_op: computeAccel.reduce.Op = .sum;
+    var chain_kind: ChainKind = .saxpy;
+    var chain_lens: []const u8 = "1,4,16,64";
 
     var i: usize = 1;
     while (i < args.len) {
@@ -204,6 +226,19 @@ pub fn main(init: std.process.Init) !void {
                 return;
             };
             i += 2;
+        } else if (std.mem.eql(u8, arg, "--chain")) {
+            if (!try requireValue(stdout_writer, args, i, "--chain")) return;
+            chain_kind = parseChainKind(args[i + 1]) orelse {
+                try stdout_writer.print("error: unknown chain '{s}' (expected saxpy|pipeline)\n", .{args[i + 1]});
+                try printUsage(stdout_writer);
+                try stdout_writer.flush();
+                return;
+            };
+            i += 2;
+        } else if (std.mem.eql(u8, arg, "--chain-lens")) {
+            if (!try requireValue(stdout_writer, args, i, "--chain-lens")) return;
+            chain_lens = args[i + 1];
+            i += 2;
         } else if (std.mem.eql(u8, arg, "--size")) {
             if (!try requireValue(stdout_writer, args, i, "--size")) return;
             size = try std.fmt.parseInt(usize, args[i + 1], 10);
@@ -238,6 +273,7 @@ pub fn main(init: std.process.Init) !void {
             .add => default_add_iters,
             .gemm => default_gemm_iters,
             .reduce => default_reduce_iters,
+            .chain => default_chain_iters,
         };
     }
 
@@ -245,6 +281,7 @@ pub fn main(init: std.process.Init) !void {
         .add => try runAddDemo(stdout_writer, arena, mode, manual_backend, size, iters),
         .gemm => try runGemmDemo(stdout_writer, arena, m, k, n, iters, variant_choice),
         .reduce => try runReduceDemo(stdout_writer, arena, size, iters, reduce_op),
+        .chain => try runChainDemo(stdout_writer, arena, chain_kind, chain_lens, size, m, k, n, iters),
     }
 
     try stdout_writer.flush();
@@ -717,4 +754,279 @@ fn runReduceDemo(
             );
         }
     }
+}
+
+fn parseLens(buffer: []usize, text: []const u8) ![]usize {
+    var count: usize = 0;
+    var iter = std.mem.splitScalar(u8, text, ',');
+    while (iter.next()) |part| {
+        const value = std.fmt.parseInt(usize, part, 10) catch return error.InvalidLens;
+        if (value == 0) return error.InvalidLens;
+        if (count == buffer.len) return error.InvalidLens;
+        buffer[count] = value;
+        count += 1;
+    }
+    if (count == 0) return error.InvalidLens;
+    return buffer[0..count];
+}
+
+/// Median of the collected samples: micro-benchmarks on a shared machine are
+/// noisy, and a median keeps the ablation table honest without cherry-picking.
+fn median(values: []u64) u64 {
+    std.mem.sort(u64, values, {}, std.sort.asc(u64));
+    return values[values.len / 2];
+}
+
+fn runChainDemo(
+    writer: *Io.Writer,
+    allocator: std.mem.Allocator,
+    kind: ChainKind,
+    lens_text: []const u8,
+    size: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    repeats: usize,
+) !void {
+    var lens_buffer: [8]usize = undefined;
+    const lens = parseLens(&lens_buffer, lens_text) catch {
+        try writer.print("error: --chain-lens must be a comma list of positive numbers\n", .{});
+        return;
+    };
+    const samples = @min(@max(repeats, 1), 8);
+
+    const probe = computeAccel.GpuContext.probe();
+    if (!probe.available) {
+        try writer.print("chain demo: gpu_webgpu 不可用（{s}）\n", .{probe.reason});
+        return;
+    }
+    const ctx = computeAccel.runtime.open() catch |err| {
+        try writer.print("chain demo: 打开设备失败（{s}）\n", .{computeAccel.gpu.lastFallbackReason() orelse @errorName(err)});
+        return;
+    };
+
+    switch (kind) {
+        .saxpy => try runSaxpyChainDemo(writer, allocator, ctx, lens, size, samples),
+        .pipeline => try runPipelineChainDemo(writer, allocator, ctx, lens, m, k, n, samples),
+    }
+}
+
+fn runSaxpyChainDemo(
+    writer: *Io.Writer,
+    allocator: std.mem.Allocator,
+    ctx: *computeAccel.runtime.Device,
+    lens: []const usize,
+    size: usize,
+    samples: usize,
+) !void {
+    const alpha: f32 = 0.999;
+    const initial = try allocator.alloc(f32, size);
+    defer allocator.free(initial);
+    const y = try allocator.alloc(f32, size);
+    defer allocator.free(y);
+    const out = try allocator.alloc(f32, size);
+    defer allocator.free(out);
+    const cpu_work = try allocator.alloc(f32, size);
+    defer allocator.free(cpu_work);
+
+    fillDeterministic(initial, 11);
+    fillDeterministic(y, 12);
+
+    // Warm-up: shader compilation and the lazy staging allocation must not be
+    // attributed to any ablation mode (they happen exactly once).
+    _ = try computeAccel.chain_bench.runSaxpyChain(allocator, ctx, size, 2, .chained, alpha, initial, y, out);
+
+    try writer.print(
+        "\n== chain ablation: saxpy (n={} f32 = {d:.2} MiB/buffer, alpha={d:.3}, {} repeats) ==\n",
+        .{ size, @as(f64, @floatFromInt(size * @sizeOf(f32))) / (1024.0 * 1024.0), alpha, samples },
+    );
+    try writer.print("chain_len  cpu_simd   per_call   per_submit   chained   chained/cpu   verify\n", .{});
+
+    for (lens) |steps| {
+        var cpu_ns: u64 = 0;
+        {
+            var times: [8]u64 = undefined;
+            for (0..samples) |sample| {
+                @memcpy(cpu_work, initial);
+                times[sample] = computeAccel.chain_bench.timeCpuSimdSaxpyChain(cpu_work, y, alpha, steps);
+            }
+            cpu_ns = median(times[0..samples]);
+        }
+
+        var mode_results: [3]computeAccel.chain_bench.SaxpyResult = undefined;
+        const modes = [_]computeAccel.chain_bench.Mode{ .per_call, .per_submit, .chained };
+        for (modes, 0..) |mode, mode_index| {
+            var times: [8]u64 = undefined;
+            var diff: f32 = 0;
+            for (0..samples) |sample| {
+                const result = computeAccel.chain_bench.runSaxpyChain(
+                    allocator,
+                    ctx,
+                    size,
+                    steps,
+                    mode,
+                    alpha,
+                    initial,
+                    y,
+                    out,
+                ) catch |err| {
+                    try writer.print(
+                        "{d:<10} {s} failed: {s}\n",
+                        .{ steps, mode.name(), computeAccel.gpu.lastFallbackReason() orelse @errorName(err) },
+                    );
+                    return;
+                };
+                times[sample] = result.total_ns;
+                diff = @max(diff, result.max_diff);
+            }
+            mode_results[mode_index] = .{
+                .total_ns = median(times[0..samples]),
+                .gbps = 0,
+                .max_diff = diff,
+            };
+        }
+
+        const bytes = @as(f64, @floatFromInt(size * @sizeOf(f32) * 3 * steps));
+        const cpu_gbps = bytes / @as(f64, @floatFromInt(cpu_ns));
+        const per_call_gbps = bytes / @as(f64, @floatFromInt(mode_results[0].total_ns));
+        const per_submit_gbps = bytes / @as(f64, @floatFromInt(mode_results[1].total_ns));
+        const chained_gbps = bytes / @as(f64, @floatFromInt(mode_results[2].total_ns));
+        const speedup = if (chained_gbps == 0) 0 else chained_gbps / cpu_gbps;
+        const verify = if (mode_results[2].max_diff <= 1e-3) "OK" else "MISMATCH";
+
+        try writer.print(
+            "{d:<10} {d:>8.2}   {d:>8.2}   {d:>10.2}   {d:>7.2}   {d:>11.2}x   {s} ({e:.2})\n",
+            .{
+                steps,
+                cpu_gbps,
+                per_call_gbps,
+                per_submit_gbps,
+                chained_gbps,
+                speedup,
+                verify,
+                mode_results[2].max_diff,
+            },
+        );
+    }
+    try writer.print("GB/s counts 3 streams (read x, read y, write x) per step; all modes compute identically.\n", .{});
+}
+
+fn runPipelineChainDemo(
+    writer: *Io.Writer,
+    allocator: std.mem.Allocator,
+    ctx: *computeAccel.runtime.Device,
+    lens: []const usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    samples: usize,
+) !void {
+    const a = try allocator.alloc(f32, m * k);
+    defer allocator.free(a);
+    const b = try allocator.alloc(f32, k * n);
+    defer allocator.free(b);
+    const bias = try allocator.alloc(f32, n);
+    defer allocator.free(bias);
+    fillDeterministic(a, 21);
+    fillDeterministic(b, 22);
+    fillDeterministic(bias, 23);
+
+    const flops = 2.0 *
+        @as(f64, @floatFromInt(m)) *
+        @as(f64, @floatFromInt(k)) *
+        @as(f64, @floatFromInt(n));
+
+    var warm_sum: f32 = 0;
+    _ = try computeAccel.chain_bench.runGemmBiasReduceChain(allocator, ctx, m, k, n, .chained, 1, a, b, bias, &warm_sum);
+
+    try writer.print(
+        "\n== chain ablation: {s} (m={} k={} n={}, {} repeats) ==\n",
+        .{ ChainKind.pipeline.name(), m, k, n, samples },
+    );
+    try writer.print("repeats  staged(ms)  chained(ms)  submit_cut   chained GFLOP/s   verify\n", .{});
+
+    for (lens) |repetitions| {
+        var staged_times: [8]u64 = undefined;
+        var chained_times: [8]u64 = undefined;
+        var staged_diff: f32 = 0;
+        var chained_diff: f32 = 0;
+        var staged_sum: f32 = 0;
+        var chained_sum: f32 = 0;
+        var reference: f32 = 0;
+        var relative_diff: f64 = 0;
+
+        for (0..samples) |sample| {
+            const staged = computeAccel.chain_bench.runGemmBiasReduceChain(
+                allocator,
+                ctx,
+                m,
+                k,
+                n,
+                .staged,
+                repetitions,
+                a,
+                b,
+                bias,
+                &staged_sum,
+            ) catch |err| {
+                try writer.print("staged failed: {s}\n", .{computeAccel.gpu.lastFallbackReason() orelse @errorName(err)});
+                return;
+            };
+            staged_times[sample] = staged.total_ns;
+            staged_diff = @max(staged_diff, staged.max_diff);
+            reference = staged.reference;
+            relative_diff = @max(relative_diff, staged.relativeDiff());
+
+            const chained = computeAccel.chain_bench.runGemmBiasReduceChain(
+                allocator,
+                ctx,
+                m,
+                k,
+                n,
+                .chained,
+                repetitions,
+                a,
+                b,
+                bias,
+                &chained_sum,
+            ) catch |err| {
+                try writer.print("chained failed: {s}\n", .{computeAccel.gpu.lastFallbackReason() orelse @errorName(err)});
+                return;
+            };
+            chained_times[sample] = chained.total_ns;
+            chained_diff = @max(chained_diff, chained.max_diff);
+            relative_diff = @max(relative_diff, chained.relativeDiff());
+        }
+
+        const staged_ns = median(staged_times[0..samples]);
+        const chained_ns = median(chained_times[0..samples]);
+        const stages: f64 = 3.0; // three host round trips in staged mode
+        const submit_cut = @as(f64, @floatFromInt(staged_ns)) / @as(f64, @floatFromInt(chained_ns));
+        const chained_gflops = (flops * @as(f64, @floatFromInt(repetitions))) /
+            @as(f64, @floatFromInt(chained_ns));
+        // A sum over m*n terms is compared with a relative tolerance: the
+        // remaining difference is only the f32 accumulation order.
+        const verify = if (relative_diff <= 1e-4) "OK" else "MISMATCH";
+
+        _ = stages;
+        try writer.print(
+            "{d:<8} {d:>10.3}  {d:>11.3}  {d:>9.2}x   {d:>14.2}   {s} (rel {e:.2})\n",
+            .{
+                repetitions,
+                @as(f64, @floatFromInt(staged_ns)) / 1e6,
+                @as(f64, @floatFromInt(chained_ns)) / 1e6,
+                submit_cut,
+                chained_gflops,
+                verify,
+                relative_diff,
+            },
+        );
+        if (repetitions == lens[lens.len - 1]) {
+            try writer.print(
+                "last sum: staged={d:.3} chained={d:.3} reference={d:.3} (abs diff {e:.2})\n",
+                .{ staged_sum, chained_sum, reference, @max(staged_diff, chained_diff) },
+            );
+        }
+    }
+    try writer.print("staged = per-stage submit+readback; chained = 4 dispatches in one submit, 1 readback.\n", .{});
 }
