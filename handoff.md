@@ -1,88 +1,107 @@
-# handoff — T3：能力探测 / 诚实回退 / 选择与 bench 集成
+# handoff — T4：修复超出 dispatch 上限的 GPU 路径（>65535 workgroups）
 
-> 当前任务文档。T1（native wgpu-native）见 commit `456e327`，T2（浏览器 wasm）见 `e522852`。
-> 上游研究 `docs/gpu-backend-research.md`，依赖 `deps/README.md`。
-> 这两个后端都已实测跑通，**不要重做**。T3 只做"选择与回退语义"，不改 kernel 与绑定。
+> T1 `456e327`（native）、T2 `e522852`（浏览器 wasm）、T3 `94d7712`（探测/诚实回退/选择）均已提交验收。
+> 本任务修 T3 暴露出来的一个**真实功能缺陷**。
 
-## 0. 一句话
+## 0. 问题（已实测定位到根因）
 
-现在的 GPU 后端**能跑，但选择逻辑会说谎**：`ComputeEngine(.gpu_webgpu)` 失败时静默
-`catch` 回退 CPU SIMD（`src/engine.zig`），于是 `--auto` 可能把"实际跑在 CPU 上的
-gpu_webgpu"选成最优后端。T3 要把这条路修成：**探测 → 明确标注 → 诚实回退**。
+T3 的诚实回退把问题暴露出来了：**`size` 稍大一点 GPU 调用就 GpuError 并回退 CPU**。
 
-## 1. 现状（先读代码确认，别凭猜）
+我实测（本机 AMD Vega/RADV，`--backend gpu_webgpu`）：
 
-| 位置 | 现状 | 问题 |
+| size | workgroups (= size/64) | 结果 |
 |---|---|---|
-| `src/engine.zig` | `.gpu_webgpu => gpu_pipeline.add(...) catch addSimd(...)` | 静默回退：调用方无法区分"GPU 跑了"还是"回退跑了" |
-| `src/bench.zig::pickBest` | `inline for` 里包含 `gpu_webgpu`，用 `timeAdd` 测 | 无能力探测；且测的是"GPU 或静默 CPU 回退"的混合体 |
-| `src/backend.zig::heuristic` | 只看 size，`gpu_webgpu` 永不入选 | 对 GPU 无感知（当前这反而是"安全"的默认） |
-| `src/main.zig` | `--auto`/`--heuristic`/`--backend` 三条路 | `--auto` 结果可能被静默回退污染 |
-| `src/gpu/context.zig` | `GpuContext.init()` 会真的建 instance/adapter/device | 可作为探测入口，但每次调用都重建，需要"探测一次 + 缓存" |
+| 4194240 | 65535 | ✅ 正常，3.354 GB/s |
+| 4194304 | 65536 | ❌ `fell back: GpuError` |
+| 8388608 | 131072 | ❌ `fell back: GpuError` |
 
-**实测事实（很重要，别假设 GPU 一定更快）**：本机 AMD Vega iGPU 上，`add`
-端到端 GPU 4.652 GB/s vs cpu_simd 14.676 GB/s（输），steady-state `gpu_batch`
-16.249 GB/s vs 14.676 GB/s（略赢）。所以 **heuristic 默认不该在 `1<<20` 这种规模
-选 GPU**；`--auto` 若选 GPU，必须是实测赢了才选，且要说明测的是哪种口径。
+根因：`src/gpu/pipeline.zig` 里只用了 1D dispatch：
 
-## 2. 交付物
+```zig
+wgpu.wgpuComputePassEncoderDispatchWorkgroups(pass, @intCast(workgroup_count), 1, 1);
+```
 
-1. **能力探测（一次 + 缓存）**
-   - `GpuContext.probe() -> ProbeResult`（或 `isAvailable()`），内部只初始化一次并缓存结果
-     （成功/失败原因），且**线程安全**（用 `std.once` 或原子，本机单线程但别留坑）。
-   - 失败要携带原因（无 instance / 无 adapter / device 创建失败），不要只返回 bool。
-2. **消除静默回退的误导**
-   - 让调用方能知道"这次到底谁跑了"：例如 `gpu_pipeline.addEx(...) -> !void`，
-     `ComputeEngine(.gpu_webgpu).add` 保留回退但把回退原因记到可查询处
-     （如 `gpu.lastFallbackReason()`），CLI 打印 `gpu_webgpu (fell back: ...)`。
-   - **不允许**在"选了 GPU 却回退"时打印成普通 GPU 结果。
-3. **选择逻辑**
-   - `heuristic(size)`：默认仍只选 CPU；仅在"探测可用 **且** size ≥ 阈值"时考虑 GPU，
-     阈值要基于本仓库的实测数据（写成常量 + 注释说明数据来源）。
-   - `bench.pickBest`：GPU 只有在 probe 成功时才纳入；测量口径统一（要么都端到端，
-     要么对 GPU 单独标注 batched 并在返回值/输出里区分），**不要**拿 batched 数字
-     去和 CPU 端到端比而宣称 GPU 更快。
-4. **测试**（`zig build test` 里）
-   - probe 失败路径：伪造/无 GPU 情况下 `pickBest` 不返回 `gpu_webgpu`。
-   - heuristic 在阈值两侧的行为。
-   - 回退路径：GPU 不可用时不 panic、不改变 CPU 结果。
-   - 保持现有 8 个测试全绿（CPU 行为、GPU 正确性测试的判定不能放松）。
-5. **README**：更新"选择逻辑"与"回退语义"两节，写清什么时候会选 GPU、怎么知道发生了回退。
+而 WebGPU 的 `maxComputeWorkgroupsPerDimension` 是 **65535**，超过就 validation error。
+代码里**完全没有查询 device limits**（`rg 'Limits|maxCompute' src/gpu/` 为空）。
 
-## 3. 硬性约束
+同时 `src/backend.zig` 的 heuristic GPU 闸门（T3 加的 `1<<22` = 4194304）正好落在这个
+失败区间里 —— 所以 `--heuristic --size 8388608` 会选一个必然回退的 GPU 路径。
+这是 T3 遗留的坑，T4 要一起修掉。
 
-- **不要改 kernel、绑定、shader、wasm/emcc 相关**（T1/T2 已验收，改动会破坏已通过的验收）。
-- 不要用 `wgpuInstanceWaitAny` / `wgpuDevicePoll` / SPIR-V / ASYNCIFY。
-- 不要引入第三方依赖。
-- 不要放宽既有断言来"让测试过"。
-- **不要 kill 任何进程、不要 kill/ps 你的父进程**：你只需要改代码。
-  如果你想看是否有构建在跑，用 `ls`/`git status`，不要动进程。
+## 1. 交付物
+
+### A. 让 dispatch 支持任意 size（核心）
+
+两条路，选一条并写清理由（注释里说明）：
+
+1. **2D grid（推荐）**：`x = min(limit, groups)`，`y = ceil(groups / x)`，
+   shader 用 `@builtin(num_workgroups)` 还原线性下标：
+   `gid = global_invocation_id.x + global_invocation_id.y * (num_workgroups.x * workgroup_size_x)`
+   （`workgroup_size_y = 1` 时 `global_invocation_id.y` 就是 y 方向的 workgroup 序号）。
+   注意 `add.wgsl` / `saxpy.wgsl` 都要改（同一套写法），并保持越界保护的语义不变。
+2. **多次 1D dispatch**：把 `groups` 切成 ≤65535 的块，每块 dispatch 一次，shader 用
+   参数 buffer 里的 `offset` 偏移下标。需要改 params uniform（注意 wgpu-native v29 已把
+   push constants 改名为 immediates，**不要用 immediates/push constants**，用 uniform buffer）。
+
+要求：**不改 kernel 语义**、不改变已有正确性断言；`workgroup_size(64)` 可保留。
+
+### B. limits 感知的能力探测
+
+- 用 `wgpuAdapterGetLimits` / `wgpuDeviceGetLimits`（都在已绑定的头文件里，符号名先在
+  `vendor/wgpu-native/include/webgpu/webgpu.h` 与 `.em-cache/.../emdawnwebgpu_pkg/webgpu/include/webgpu/webgpu.h`
+  里核对）读取并缓存：
+  - `maxComputeWorkgroupsPerDimension`
+  - `maxStorageBufferBindingSize`
+  - `maxBufferSize`
+- `GpuContext.probe()` 结果里带上这些 limits；
+- 提供 `GpuContext.canRun(n_bytes, groups) -> bool`（或等价 API），让选择逻辑能问
+  "这个 size 的 GPU 路径可行吗"。
+
+### C. 选择逻辑
+
+- `heuristic` 的 GPU 闸门不能只看 size，必须**同时**满足：probe 成功 + size/字节数在 limits 内。
+  修完后 `--heuristic --size 8388608` 必须走通（GPU 真跑，不退化成 GpuError 回退）。
+- `bench.pickBest` / `--auto` 沿用 T3 语义（真实端到端胜出才选 GPU），但要保证
+  大 size 下 GPU 候选是"真的能跑"的，而不是必然失败后回退。
+
+### D. 测试
+
+- 新增：`size` 刚超过 65535 workgroups 的 GPU 正确性测试（例如 `1<<22`，即 65536 groups），
+  与 `cpu_scalar`/`cpu_simd` 逐元素一致，**且断言没有发生 fallback**。
+- 新增：probe/limits 相关单元测试（例如 `canRun` 边界）。
+- 保持现有 11 个测试全绿。
+
+### E. README
+
+更新"限制与已知边界"：workgroup 上限怎么处理、大 size 表现、limits 从哪来。
+
+## 2. 硬性约束
+
+- 不要破坏 T1/T2 的验收：`zig build test` 全绿、`zig build wasm` 成功、
+  `--backend gpu_webgpu --size 1048576` 正常。
+- 不要用 `wgpuInstanceWaitAny` / `wgpuDevicePoll` / SPIR-V / ASYNCIFY / push constants(immediates)。
+- **不许 kill 任何进程**（尤其不要动 pi 进程）。
+- 不要放宽既有断言来"让测试过"；不要伪造实测结论。
 - 完成后 `git commit`（中文，含实测输出）。
 
-## 4. 验收标准（自己实测并贴证据）
+## 3. 验收标准
 
 1. `zig build test --summary all` → 全绿（含新增测试）。
-2. `zig build run -- --auto --size 1048576` → 输出不谎报：若选 `gpu_webgpu`，
-   必须能说明它实测更快；若选 `cpu_simd`，也要能解释（当前本机就该是这种情况）。
-3. 人为制造 GPU 不可用的路径（例如临时用 `VK_ICD_FILENAMES=/nonexistent.json`
-   或在测试里注入失败），验证：
-   - 不 panic；
-   - 结果仍正确（回退 CPU）；
-   - 输出明确标注发生了回退。
-4. `zig build run -- --backend gpu_webgpu --size 1048576 --iters 20` 仍正常（T1 验收不回归）。
-5. `git commit`。
+2. `--backend gpu_webgpu` 在 `size = 4194304` 与 `8388608` 上**不再 fallback**，
+   结果 `5.0`，并打印吞吐。
+3. `--heuristic --size 8388608` → 选中 GPU 且真的跑在 GPU 上（不退化成 GpuError）。
+4. `--backend gpu_webgpu --size 1048576` 仍正常（T1 不回归）。
+5. `zig build wasm` 成功（T2 不回归），并说明浏览器端 shader 是否同步改动。
+6. `tools/check_abi_drift.sh` → OK。
 
-## 5. 命令
+## 4. 命令
 
 ```bash
 zig build test --summary all
+zig build run -- --backend gpu_webgpu --size 4194304 --iters 5
+zig build run -- --backend gpu_webgpu --size 8388608 --iters 5
+zig build run -- --heuristic --size 8388608
 zig build run -- --auto --size 1048576
-zig build run -- --heuristic --size 1048576
-zig build run -- --backend gpu_webgpu --size 1048576 --iters 20
-VK_ICD_FILENAMES=/nonexistent.json zig build run -- --backend gpu_webgpu --size 1048576
-tools/check_abi_drift.sh        # 只读检查，不改绑定
+zig build wasm
+tools/check_abi_drift.sh
 ```
-
-> 注：`zig build` 输出里若出现 `failed command: ...`，是 Zig 0.16 对"子命令往 stderr
-> 写过东西"的前缀噪音（emcc 的 clang 版本 warning 也会触发）；以
-> `Build Summary: ... success` 和退出码为准。
