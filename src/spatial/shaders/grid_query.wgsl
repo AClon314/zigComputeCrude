@@ -10,7 +10,7 @@ struct Params {
     point_count: u32,
     query_count: u32,
     radius: f32,
-    pad0: u32,
+    max_neighbors: u32,
     pad1: u32,
 };
 
@@ -20,7 +20,8 @@ struct Params {
 @group(0) @binding(3) var<storage, read> slots: array<u32>;
 @group(0) @binding(4) var<storage, read> queries: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read_write> out_counts: array<u32>;
-@group(0) @binding(6) var<uniform> params: Params;
+@group(0) @binding(6) var<storage, read_write> neighbors: array<u32>;
+@group(0) @binding(7) var<uniform> params: Params;
 
 fn insideGrid(p: vec3<f32>) -> bool {
     if (p.x < params.min_x || p.y < params.min_y || p.z < params.min_z) {
@@ -77,8 +78,12 @@ fn query_counts(
                     var slot = start;
                     loop {
                         if (slot >= end) { break; }
-                        let d = points[slots[slot]].xyz - center;
+                        let other = slots[slot];
+                        let d = points[other].xyz - center;
                         if (dot(d, d) <= r2) {
+                            if (total < params.max_neighbors) {
+                                neighbors[q * params.max_neighbors + total] = other;
+                            }
                             total = total + 1u;
                         }
                         slot = slot + 1u;

@@ -1174,7 +1174,7 @@ fn runSpatialDemo(
         return;
     };
 
-    var index = spatial.GridIndex.init(ctx, grid, point_count, query_count) catch |err| {
+    var index = spatial.GridIndex.init(ctx, grid, point_count, query_count, 16) catch |err| {
         try writer.print("gpu_webgpu: 建索引失败（{s}）\n", .{computeAccel.gpu.lastFallbackReason() orelse @errorName(err)});
         return;
     };

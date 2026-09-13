@@ -168,6 +168,68 @@ pub fn queryCounts(
     }
 }
 
+/// Neighbor lists: like `queryCounts`, but also stores up to `max_neighbors`
+/// point indices per query at `out_neighbors[q * max_neighbors + j]` (slot
+/// order, which is nondeterministic on the GPU; compare sorted in tests).
+pub fn queryNeighbors(
+    grid: Grid,
+    xs: []const f32,
+    ys: []const f32,
+    zs: []const f32,
+    counts: []const u32,
+    offsets: []const u32,
+    slots: []const u32,
+    qx: []const f32,
+    qy: []const f32,
+    qz: []const f32,
+    radius: f32,
+    max_neighbors: usize,
+    out_counts: []u32,
+    out_neighbors: []u32,
+) void {
+    std.debug.assert(out_counts.len == qx.len);
+    std.debug.assert(out_neighbors.len >= qx.len * max_neighbors);
+    const r2 = radius * radius;
+
+    for (0..qx.len) |q| {
+        const center = Vec3{ .x = qx[q], .y = qy[q], .z = qz[q] };
+        var total: u32 = 0;
+        if (grid.cellOf(center) != null) {
+            const ix0 = clampCell(center.x - radius, grid.min.x, grid.cell_size, grid.gx);
+            const ix1 = clampCell(center.x + radius, grid.min.x, grid.cell_size, grid.gx);
+            const iy0 = clampCell(center.y - radius, grid.min.y, grid.cell_size, grid.gy);
+            const iy1 = clampCell(center.y + radius, grid.min.y, grid.cell_size, grid.gy);
+            const iz0 = clampCell(center.z - radius, grid.min.z, grid.cell_size, grid.gz);
+            const iz1 = clampCell(center.z + radius, grid.min.z, grid.cell_size, grid.gz);
+
+            var iz = iz0;
+            while (iz <= iz1) : (iz += 1) {
+                var iy = iy0;
+                while (iy <= iy1) : (iy += 1) {
+                    var ix = ix0;
+                    while (ix <= ix1) : (ix += 1) {
+                        const id = grid.cellId(.{ ix, iy, iz });
+                        const start = offsets[id];
+                        const end = start + counts[id];
+                        for (slots[start..end]) |point| {
+                            const dx = xs[point] - center.x;
+                            const dy = ys[point] - center.y;
+                            const dz = zs[point] - center.z;
+                            if (dx * dx + dy * dy + dz * dz <= r2) {
+                                if (total < max_neighbors) {
+                                    out_neighbors[q * max_neighbors + total] = point;
+                                }
+                                total += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out_counts[q] = total;
+    }
+}
+
 /// O(points x queries) reference, used by tests to validate `queryCounts`
 /// (it counts every point, including ones the grid may not index).
 pub fn bruteForceCounts(

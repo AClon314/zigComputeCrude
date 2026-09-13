@@ -281,7 +281,7 @@ docs/ tools/                # 保持
 | **M2 图像与图调度** | 库内 | 2D tile、逐像素/可分离卷积/金字塔、kernel 融合、通用 op-graph 调度（IR 雏形） | 一张融合后的图像 op-graph 与逐算子实现逐元素对拍；融合前后 profile |
 | **M2' Blender 合成节点** | 中间件 | 合成节点语义、OCIO 色彩策略、图像源/缓存 | 与 Blender 参考输出对拍；不进本库里程碑 |
 | **M3 原语补齐**（进行中） | 库内 | ✅ scan（u32 排他前缀和，3 段链 + CPU 对拍）、✅ compaction（flags→scan→scatter+total，count 可作 indirect 参数）、✅ indirect dispatch（ABI 32 符号 + 测试）、✅ atomics（网格计数/散射已验证）；⬜ sort、texture/sampler/format/mip | 纹理噪声跨后端一致；sort 与 CPU 对拍 |
-| **S1 空间原语（按需）**（进行中） | 库内 | ✅ 均匀网格索引（GPU：clear → atomics count → scan → atomic scatter → 半径查询；CPU 参考对拍；消融 111x→359x vs 暴力）；⬜ BVH 构建/遍历、空间哈希、kNN | 该消费方的 workload 对拍 + 消融（相对暴力解法） |
+| **S1 空间原语（按需）**（进行中） | 库内 | ✅ 均匀网格索引（GPU：clear → atomics count → scan → atomic scatter → 半径查询 + 固定容量邻接表/kNN；CPU 参考对拍；消融 111x→359x vs 暴力）；⬜ BVH 构建/遍历、空间哈希 | 该消费方的 workload 对拍 + 消融（相对暴力解法） |
 | — | 中间件 | Blender 域模型（point/face/corner/spline/instance/volume）、属性传播语义、字段求值、Simulation/Repeat/For-Each zone、bake/cache 策略、节点解析与节点语义 | 不在本库；由消费方实现与验收 |
 | 独立立项 | 库外 | **Shader nodes**：SVM→WGSL 编译器 + 纹理/采样/导数 | 不在本库主线内，单独立项评估 |
 
@@ -296,6 +296,11 @@ docs/ tools/                # 保持
 3. 所有 Blender 语义（节点类型、域模型、属性传播、色彩策略、外部库集成）
    属于**中间件**；本库只提供它们需要的原语与调度。`Shader nodes` 是独立的
    编译器项目，不在本库范围。
+
+**Step 7（S1 邻接表，已实现）**：查询 kernel 增加第 8 个 binding（`neighbors`），
+按 `max_neighbors` 容量写每个查询的邻居点索引（`neighbors[q*K + j]`），计数仍在
+`out_counts`；CPU 参考 `queryNeighbors` 同语义，测试在稀疏场景（count ≤ K）比较
+排序后的邻居集合。碰撞检测的 broad phase 需要的正是这种固定容量邻接表。
 
 **Step 6（M1 异步 readback，已实现）**：`Chain.submitAsync()` 只做
 end-pass/录制 copy/提交，`Chain.wait()` 才映射并拷贝 download；`submit()` 保持

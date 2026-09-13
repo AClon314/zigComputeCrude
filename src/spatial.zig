@@ -17,6 +17,7 @@ pub const Grid = grid_hash.Grid;
 pub const Vec3 = grid_hash.Vec3;
 pub const build = grid_hash.build;
 pub const queryCounts = grid_hash.queryCounts;
+pub const queryNeighbors = grid_hash.queryNeighbors;
 pub const bruteForceCounts = grid_hash.bruteForceCounts;
 pub const gridCovering = grid_hash.gridCovering;
 

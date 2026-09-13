@@ -42,7 +42,7 @@ pub const GpuParams = extern struct {
     point_count: u32,
     query_count: u32,
     radius: f32,
-    pad0: u32 = 0,
+    max_neighbors: u32 = 0,
     pad1: u32 = 0,
 };
 
@@ -52,6 +52,7 @@ pub const GridIndex = struct {
     cells: usize,
     max_points: usize,
     max_queries: usize,
+    max_neighbors: usize,
 
     counts: runtime.Buffer,
     offsets: runtime.Buffer,
@@ -60,6 +61,7 @@ pub const GridIndex = struct {
     points_buf: runtime.Buffer,
     queries_buf: runtime.Buffer,
     out_counts: runtime.Buffer,
+    neighbors: runtime.Buffer,
     params_build: runtime.Buffer,
     params_query: runtime.Buffer,
 
@@ -82,9 +84,12 @@ pub const GridIndex = struct {
         grid: reference.Grid,
         max_points: usize,
         max_queries: usize,
+        max_neighbors: usize,
     ) !GridIndex {
         const cells = grid.cellCount();
-        if (cells == 0 or max_points == 0 or max_queries == 0) return error.GpuError;
+        if (cells == 0 or max_points == 0 or max_queries == 0 or max_neighbors == 0) {
+            return error.GpuError;
+        }
 
         const cell_bytes = cells * @sizeOf(u32);
         const storage_cell = runtime.buffer.storage_rw;
@@ -95,6 +100,7 @@ pub const GridIndex = struct {
             .cells = cells,
             .max_points = max_points,
             .max_queries = max_queries,
+            .max_neighbors = max_neighbors,
             .counts = try runtime.Buffer.init(ctx, cell_bytes, storage_cell),
             .offsets = undefined,
             .cursor = undefined,
@@ -102,6 +108,7 @@ pub const GridIndex = struct {
             .points_buf = undefined,
             .queries_buf = undefined,
             .out_counts = undefined,
+            .neighbors = undefined,
             .params_build = undefined,
             .params_query = undefined,
             .clear_kernel = undefined,
@@ -125,6 +132,11 @@ pub const GridIndex = struct {
         self.points_buf = try runtime.Buffer.init(ctx, max_points * @sizeOf(Point), runtime.buffer.storage_r);
         self.queries_buf = try runtime.Buffer.init(ctx, max_queries * @sizeOf(Point), runtime.buffer.storage_r);
         self.out_counts = try runtime.Buffer.init(ctx, max_queries * @sizeOf(u32), storage_cell);
+        self.neighbors = try runtime.Buffer.init(
+            ctx,
+            max_queries * max_neighbors * @sizeOf(u32),
+            storage_cell,
+        );
         self.params_build = try runtime.Buffer.init(ctx, @sizeOf(GpuParams), runtime.buffer.uniform);
         self.params_query = try runtime.Buffer.init(ctx, @sizeOf(GpuParams), runtime.buffer.uniform);
 
@@ -149,13 +161,14 @@ pub const GridIndex = struct {
             .{ .kind = .uniform, .access = .read },
         }, 64);
         self.query_kernel = try runtime.Kernel.init(ctx, query_shader, "query_counts", &.{
-            .{ .kind = .storage, .access = .read },
-            .{ .kind = .storage, .access = .read },
-            .{ .kind = .storage, .access = .read },
-            .{ .kind = .storage, .access = .read },
-            .{ .kind = .storage, .access = .read },
-            .{ .kind = .storage, .access = .write },
-            .{ .kind = .uniform, .access = .read },
+            .{ .kind = .storage, .access = .read }, // points
+            .{ .kind = .storage, .access = .read }, // counts
+            .{ .kind = .storage, .access = .read }, // offsets
+            .{ .kind = .storage, .access = .read }, // slots
+            .{ .kind = .storage, .access = .read }, // queries
+            .{ .kind = .storage, .access = .write }, // out_counts
+            .{ .kind = .storage, .access = .write }, // neighbors
+            .{ .kind = .uniform, .access = .read }, // params
         }, 64);
 
         self.scanner = try primitives.Scanner.init(ctx, primitives.scanBlockCount(cells));
@@ -175,6 +188,7 @@ pub const GridIndex = struct {
             &self.slots,
             &self.queries_buf,
             &self.out_counts,
+            &self.neighbors,
             &self.params_query,
         });
         errdefer runtime.releaseBindGroup(self.bind_query.?);
@@ -205,6 +219,7 @@ pub const GridIndex = struct {
 
         self.params_query.deinit(self.ctx);
         self.params_build.deinit(self.ctx);
+        self.neighbors.deinit(self.ctx);
         self.out_counts.deinit(self.ctx);
         self.queries_buf.deinit(self.ctx);
         self.points_buf.deinit(self.ctx);
@@ -226,6 +241,7 @@ pub const GridIndex = struct {
             .point_count = 0,
             .query_count = 0,
             .radius = 0,
+            .max_neighbors = @intCast(self.max_neighbors),
         };
         self.params_build.markHostDirty();
         try self.params_build.toDevice(self.ctx, std.mem.asBytes(&params));
@@ -253,6 +269,7 @@ pub const GridIndex = struct {
             .point_count = @intCast(point_count),
             .query_count = 0,
             .radius = 0,
+            .max_neighbors = @intCast(self.max_neighbors),
         };
         self.params_build.markHostDirty();
         try self.params_build.toDevice(self.ctx, std.mem.asBytes(&params));
@@ -294,6 +311,7 @@ pub const GridIndex = struct {
             .point_count = 0,
             .query_count = @intCast(query_count),
             .radius = radius,
+            .max_neighbors = @intCast(self.max_neighbors),
         };
         self.params_query.markHostDirty();
         try self.params_query.toDevice(self.ctx, std.mem.asBytes(&params));
@@ -308,6 +326,7 @@ pub const GridIndex = struct {
             &self.slots,
             &self.queries_buf,
             &self.out_counts,
+            &self.neighbors,
             &self.params_query,
         }, query_grid);
     }
@@ -427,7 +446,7 @@ test "gpu grid build and radius query match the cpu reference" {
     defer gpa.free(expected);
 
     // GPU: one chain = build + query, one submit, two readbacks.
-    var index = try GridIndex.init(ctx, scene.grid, n, q);
+    var index = try GridIndex.init(ctx, scene.grid, n, q, 16);
     defer index.deinit();
 
     const gpu_counts = try gpa.alloc(u32, q);
@@ -500,7 +519,7 @@ test "gpu grid query with degenerate inputs" {
         .gy = 8,
         .gz = 8,
     };
-    var index = try GridIndex.init(ctx, grid, 8, 8);
+    var index = try GridIndex.init(ctx, grid, 8, 8, 4);
     defer index.deinit();
 
     const out = try gpa.alloc(u32, queries.len);
@@ -515,4 +534,82 @@ test "gpu grid query with degenerate inputs" {
 
     try std.testing.expectEqual(@as(u32, 1), out[0]);
     try std.testing.expectEqual(@as(u32, 0), out[1]);
+}
+
+test "gpu grid neighbor lists match the cpu reference" {
+    const gpa = std.testing.allocator;
+    const ctx = runtime.open() catch |err| switch (err) {
+        error.GpuError => return error.SkipZigTest,
+    };
+
+    // Sparse enough that every count fits in max_neighbors, so the truncated
+    // lists are order-insensitive (compare sorted).
+    const n: usize = 2048;
+    const q: usize = 64;
+    const radius: f32 = 0.5;
+    const max_neighbors: usize = 8;
+    var scene = try makeScene(gpa, n, q, 41);
+    defer freeScene(gpa, &scene);
+
+    const cells = scene.grid.cellCount();
+    const cpu_cell_counts = try gpa.alloc(u32, cells);
+    defer gpa.free(cpu_cell_counts);
+    const cpu_offsets = try gpa.alloc(u32, cells);
+    defer gpa.free(cpu_offsets);
+    const cpu_cursor = try gpa.alloc(u32, cells);
+    defer gpa.free(cpu_cursor);
+    const cpu_slots = try gpa.alloc(u32, n);
+    defer gpa.free(cpu_slots);
+    const cpu_counts = try gpa.alloc(u32, q);
+    defer gpa.free(cpu_counts);
+    const cpu_neighbors = try gpa.alloc(u32, q * max_neighbors);
+    defer gpa.free(cpu_neighbors);
+
+    reference.build(scene.grid, scene.xs, scene.ys, scene.zs, cpu_cell_counts, cpu_offsets, cpu_cursor, cpu_slots);
+    reference.queryNeighbors(
+        scene.grid,
+        scene.xs,
+        scene.ys,
+        scene.zs,
+        cpu_cell_counts,
+        cpu_offsets,
+        cpu_slots,
+        scene.qx,
+        scene.qy,
+        scene.qz,
+        radius,
+        max_neighbors,
+        cpu_counts,
+        cpu_neighbors,
+    );
+
+    var index = try GridIndex.init(ctx, scene.grid, n, q, max_neighbors);
+    defer index.deinit();
+
+    const gpu_counts = try gpa.alloc(u32, q);
+    defer gpa.free(gpu_counts);
+    const gpu_neighbors = try gpa.alloc(u32, q * max_neighbors);
+    defer gpa.free(gpu_neighbors);
+
+    var chain = try runtime.Chain.begin(ctx);
+    defer chain.deinit();
+    try index.build(&chain, scene.points, n);
+    try index.query(&chain, scene.queries, q, radius);
+    try chain.download(&index.out_counts, std.mem.sliceAsBytes(gpu_counts));
+    try chain.download(&index.neighbors, std.mem.sliceAsBytes(gpu_neighbors));
+    try chain.submit();
+
+    for (cpu_counts, gpu_counts) |expected, actual| {
+        try std.testing.expectEqual(expected, actual);
+        try std.testing.expect(expected <= max_neighbors);
+    }
+
+    for (0..q) |query| {
+        const count = cpu_counts[query];
+        const cpu_list = cpu_neighbors[query * max_neighbors ..][0..count];
+        const gpu_list = gpu_neighbors[query * max_neighbors ..][0..count];
+        std.mem.sort(u32, cpu_list, {}, std.sort.asc(u32));
+        std.mem.sort(u32, gpu_list, {}, std.sort.asc(u32));
+        try std.testing.expectEqualSlices(u32, cpu_list, gpu_list);
+    }
 }
