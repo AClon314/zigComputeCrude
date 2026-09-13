@@ -11,6 +11,7 @@
 //!     scatter) land in the next step and are validated against this reference.
 
 pub const grid_hash = @import("spatial/grid_hash.zig");
+pub const grid_hash_gpu = @import("spatial/grid_hash_gpu.zig");
 
 pub const Grid = grid_hash.Grid;
 pub const Vec3 = grid_hash.Vec3;
@@ -19,6 +20,10 @@ pub const queryCounts = grid_hash.queryCounts;
 pub const bruteForceCounts = grid_hash.bruteForceCounts;
 pub const gridCovering = grid_hash.gridCovering;
 
+pub const GridIndex = grid_hash_gpu.GridIndex;
+pub const Point = grid_hash_gpu.Point;
+
 test {
     _ = grid_hash;
+    _ = grid_hash_gpu;
 }

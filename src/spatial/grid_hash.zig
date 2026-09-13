@@ -32,8 +32,9 @@ pub const Grid = struct {
     }
 
     /// Cell of a position, or null when the position lies outside the grid.
-    /// Positions exactly on the upper boundary are clamped into the last cell,
-    /// matching the `min(dim - 1, ...)` guard used by the GPU kernel.
+    /// "Outside" is `p < min` or `p >= min + cell_size * dim` on any axis
+    /// (matching `insideGrid`/`cellIndex` in the GPU kernels);
+    /// `gridCovering` pads the extent so every data point stays inside.
     pub fn cellOf(self: Grid, p: Vec3) ?[3]u32 {
         if (self.gx == 0 or self.gy == 0 or self.gz == 0) return null;
         if (p.x < self.min.x or p.y < self.min.y or p.z < self.min.z) return null;
@@ -42,10 +43,16 @@ pub const Grid = struct {
         const fy = (p.y - self.min.y) / self.cell_size;
         const fz = (p.z - self.min.z) / self.cell_size;
         if (fx < 0 or fy < 0 or fz < 0) return null;
+        if (fx >= @as(f32, @floatFromInt(self.gx)) or
+            fy >= @as(f32, @floatFromInt(self.gy)) or
+            fz >= @as(f32, @floatFromInt(self.gz)))
+        {
+            return null;
+        }
 
-        const cx = @min(@as(u32, @intFromFloat(@floor(fx))), self.gx - 1);
-        const cy = @min(@as(u32, @intFromFloat(@floor(fy))), self.gy - 1);
-        const cz = @min(@as(u32, @intFromFloat(@floor(fz))), self.gz - 1);
+        const cx: u32 = @intFromFloat(@floor(fx));
+        const cy: u32 = @intFromFloat(@floor(fy));
+        const cz: u32 = @intFromFloat(@floor(fz));
         return .{ cx, cy, cz };
     }
 

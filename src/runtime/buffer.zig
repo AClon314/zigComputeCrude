@@ -60,12 +60,16 @@ pub const Buffer = struct {
         self.byte_size = 0;
     }
 
-    /// Upload host bytes.  Skipped when the device is already the newest side
-    /// (`device`/`synced`), which is what makes a resident buffer cheap to
-    /// reuse across chains.  The caller must call `markHostDirty()` after
-    /// mutating the host slice, otherwise the skip would upload stale data.
+    /// Upload host bytes.  A prefix shorter than the buffer is allowed (used
+    /// when a kernel only reads the first `count` elements of a capacity-sized
+    /// buffer); the untouched tail keeps whatever the device had.
+    ///
+    /// Skipped when the device is already the newest side (`device`/`synced`),
+    /// which is what makes a resident buffer cheap to reuse across chains.  The
+    /// caller must call `markHostDirty()` after mutating the host slice,
+    /// otherwise the skip would upload stale data.
     pub fn toDevice(self: *Buffer, ctx: *GpuContext, bytes: []const u8) !void {
-        if (bytes.len != self.byte_size) return error.GpuError;
+        if (bytes.len == 0 or bytes.len > self.byte_size) return error.GpuError;
         if (self.sync != .host) return;
         ctx.writeBytes(self.handle, bytes);
         self.sync = .synced;
@@ -82,11 +86,12 @@ pub const Buffer = struct {
         self.sync = .device;
     }
 
-    /// Blocking readback outside a chain (map + copy + unmap).
+    /// Blocking readback outside a chain (map + copy + unmap).  A prefix of the
+    /// buffer is allowed.
     pub fn toHost(self: *Buffer, ctx: *GpuContext, out: []u8) !void {
-        if (out.len != self.byte_size) return error.GpuError;
+        if (out.len == 0 or out.len > self.byte_size) return error.GpuError;
         try self.ensureStaging(ctx);
-        try ctx.copyBufferToStaging(self.handle, self.staging, self.byte_size);
+        try ctx.copyBufferToStaging(self.handle, self.staging, out.len);
         try ctx.readBuffer(self.staging, out);
         self.sync = .synced;
     }

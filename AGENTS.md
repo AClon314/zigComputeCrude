@@ -52,7 +52,7 @@ Blender/节点的语义（域模型、属性传播、节点图求值、色彩/�
 | module | 归属内容 | 规则 |
 |---|---|---|
 | `computeAccel` | CPU 内核、GPU 后端、runtime、通用原语、探测/选择 | wgpu 链接可用 `-Dwebgpu=false` 关掉；不得 import `computeAccel_spatial` |
-| `computeAccel_spatial` | 领域无关的空间原语（S1） | 只能依赖 `computeAccel` 的公开 API；不得被主 module 反向 import |
+| `computeAccel_spatial` | 领域无关的空间原语（S1）：均匀网格索引（GPU build+query，CPU 参考对拍） | 只能依赖 `computeAccel` 的公开 API；不得被主 module 反向 import；GPU 布局保持 WebGPU 基线（≤8 storage binding/阶段，AoS vec4 是为此的取舍） |
 
 新增一类功能（图像、物理、其他域）= **新增一个 module**，不要塞进主 module。
 每次新增 module 都要同步 `tools/tree_shake_probe.zig` 的断言清单（保证"未引用即不编译"）。

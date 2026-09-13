@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const computeAccel = @import("computeAccel");
+const spatial = @import("computeAccel_spatial");
 const BackendType = computeAccel.BackendType;
 const SelectionMode = computeAccel.SelectionMode;
 
@@ -12,8 +13,11 @@ const default_gemm_iters: usize = 5;
 const default_reduce_size: usize = 1 << 22;
 const default_reduce_iters: usize = 10;
 const default_chain_iters: usize = 3;
+const default_spatial_points: usize = 1 << 16;
+const default_spatial_queries: usize = 1 << 12;
+const default_spatial_radius: f32 = 2.0;
 
-const Kernel = enum { add, gemm, reduce, chain };
+const Kernel = enum { add, gemm, reduce, chain, spatial };
 const VariantChoice = enum { simple, tiled, both };
 const ChainKind = enum {
     saxpy,
@@ -46,6 +50,7 @@ fn parseKernel(name: []const u8) ?Kernel {
     if (std.mem.eql(u8, name, "gemm")) return .gemm;
     if (std.mem.eql(u8, name, "reduce")) return .reduce;
     if (std.mem.eql(u8, name, "chain")) return .chain;
+    if (std.mem.eql(u8, name, "spatial")) return .spatial;
     return null;
 }
 
@@ -132,6 +137,7 @@ fn printUsage(writer: *Io.Writer) !void {
             "       computeAccel --kernel gemm [--m <n>] [--k <n>] [--n <n>] [--variant simple|tiled|both] [--iters <n>]\n" ++
             "       computeAccel --kernel reduce [--size <n>] [--op sum|max] [--iters <n>]\n" ++
             "       computeAccel --kernel chain [--chain saxpy|pipeline] [--chain-lens 1,4,16,64] [--size <n>] [--iters <n>]\n" ++
+            "       computeAccel --kernel spatial [--points <n>] [--queries <n>] [--radius <r>] [--iters <n>]\n" ++
             "   --kernel add is the default; --backend/--auto/--heuristic only apply to it.\n",
         .{},
     );
@@ -178,6 +184,9 @@ pub fn main(init: std.process.Init) !void {
     var reduce_op: computeAccel.reduce.Op = .sum;
     var chain_kind: ChainKind = .saxpy;
     var chain_lens: []const u8 = "1,4,16,64";
+    var point_count: usize = default_spatial_points;
+    var query_count: usize = default_spatial_queries;
+    var radius: f32 = default_spatial_radius;
 
     var i: usize = 1;
     while (i < args.len) {
@@ -235,6 +244,18 @@ pub fn main(init: std.process.Init) !void {
                 return;
             };
             i += 2;
+        } else if (std.mem.eql(u8, arg, "--points")) {
+            if (!try requireValue(stdout_writer, args, i, "--points")) return;
+            point_count = try std.fmt.parseInt(usize, args[i + 1], 10);
+            i += 2;
+        } else if (std.mem.eql(u8, arg, "--queries")) {
+            if (!try requireValue(stdout_writer, args, i, "--queries")) return;
+            query_count = try std.fmt.parseInt(usize, args[i + 1], 10);
+            i += 2;
+        } else if (std.mem.eql(u8, arg, "--radius")) {
+            if (!try requireValue(stdout_writer, args, i, "--radius")) return;
+            radius = try std.fmt.parseFloat(f32, args[i + 1]);
+            i += 2;
         } else if (std.mem.eql(u8, arg, "--chain-lens")) {
             if (!try requireValue(stdout_writer, args, i, "--chain-lens")) return;
             chain_lens = args[i + 1];
@@ -274,6 +295,7 @@ pub fn main(init: std.process.Init) !void {
             .gemm => default_gemm_iters,
             .reduce => default_reduce_iters,
             .chain => default_chain_iters,
+            .spatial => default_chain_iters,
         };
     }
 
@@ -282,6 +304,7 @@ pub fn main(init: std.process.Init) !void {
         .gemm => try runGemmDemo(stdout_writer, arena, m, k, n, iters, variant_choice),
         .reduce => try runReduceDemo(stdout_writer, arena, size, iters, reduce_op),
         .chain => try runChainDemo(stdout_writer, arena, chain_kind, chain_lens, size, m, k, n, iters),
+        .spatial => try runSpatialDemo(stdout_writer, arena, point_count, query_count, radius, iters),
     }
 
     try stdout_writer.flush();
@@ -1029,4 +1052,224 @@ fn runPipelineChainDemo(
         }
     }
     try writer.print("staged = per-stage submit+readback; chained = 4 dispatches in one submit, 1 readback.\n", .{});
+}
+
+fn runSpatialDemo(
+    writer: *Io.Writer,
+    allocator: std.mem.Allocator,
+    point_count: usize,
+    query_count: usize,
+    radius: f32,
+    repeats: usize,
+) !void {
+    if (point_count == 0 or query_count == 0 or radius < 0) {
+        try writer.print("error: --points/--queries must be positive and --radius >= 0\n", .{});
+        return;
+    }
+
+    const box: f32 = 64.0;
+    const dim: u32 = 64;
+    const grid = spatial.Grid{
+        .min = .{ .x = 0, .y = 0, .z = 0 },
+        .cell_size = box / @as(f32, @floatFromInt(dim)),
+        .gx = dim,
+        .gy = dim,
+        .gz = dim,
+    };
+    const cells = grid.cellCount();
+    const samples = @min(@max(repeats, 1), 8);
+
+    // Points inside the grid; query centers kept away from the border so the
+    // radius sphere never leaves the grid (grid and brute force then agree).
+    const points = try allocator.alloc(spatial.Point, point_count);
+    defer allocator.free(points);
+    const xs = try allocator.alloc(f32, point_count);
+    defer allocator.free(xs);
+    const ys = try allocator.alloc(f32, point_count);
+    defer allocator.free(ys);
+    const zs = try allocator.alloc(f32, point_count);
+    defer allocator.free(zs);
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const random = prng.random();
+    for (points, 0..) |*point, index| {
+        const x = random.float(f32) * box;
+        const y = random.float(f32) * box;
+        const z = random.float(f32) * box;
+        point.* = .{ x, y, z, 1.0 };
+        xs[index] = x;
+        ys[index] = y;
+        zs[index] = z;
+    }
+
+    const queries = try allocator.alloc(spatial.Point, query_count);
+    defer allocator.free(queries);
+    const qx = try allocator.alloc(f32, query_count);
+    defer allocator.free(qx);
+    const qy = try allocator.alloc(f32, query_count);
+    defer allocator.free(qy);
+    const qz = try allocator.alloc(f32, query_count);
+    defer allocator.free(qz);
+    const margin = @min(radius + 0.5, box / 2 - 0.5);
+    for (queries, 0..) |*query, index| {
+        const x = margin + random.float(f32) * (box - 2 * margin);
+        const y = margin + random.float(f32) * (box - 2 * margin);
+        const z = margin + random.float(f32) * (box - 2 * margin);
+        query.* = .{ x, y, z, 1.0 };
+        qx[index] = x;
+        qy[index] = y;
+        qz[index] = z;
+    }
+
+    try writer.print(
+        "\n== spatial grid: {} points in [0,{d:.0})^3, {} queries, radius={d:.2}, cells={}^3 ==\n",
+        .{ point_count, box, query_count, radius, dim },
+    );
+
+    // ---- CPU grid ----
+    const cpu_counts = try allocator.alloc(u32, cells);
+    defer allocator.free(cpu_counts);
+    const cpu_offsets = try allocator.alloc(u32, cells);
+    defer allocator.free(cpu_offsets);
+    const cpu_cursor = try allocator.alloc(u32, cells);
+    defer allocator.free(cpu_cursor);
+    const cpu_slots = try allocator.alloc(u32, point_count);
+    defer allocator.free(cpu_slots);
+    const cpu_out = try allocator.alloc(u32, query_count);
+    defer allocator.free(cpu_out);
+    const brute_out = try allocator.alloc(u32, query_count);
+    defer allocator.free(brute_out);
+
+    var cpu_build_ns: u64 = 0;
+    var cpu_query_ns: u64 = 0;
+    var cpu_brute_ns: u64 = 0;
+    {
+        const t0 = computeAccel.bench.nowNs();
+        spatial.build(grid, xs, ys, zs, cpu_counts, cpu_offsets, cpu_cursor, cpu_slots);
+        cpu_build_ns = @intCast(@max(0, computeAccel.bench.nowNs() - t0));
+    }
+    {
+        const t0 = computeAccel.bench.nowNs();
+        spatial.queryCounts(grid, xs, ys, zs, cpu_counts, cpu_offsets, cpu_slots, qx, qy, qz, radius, cpu_out);
+        cpu_query_ns = @intCast(@max(0, computeAccel.bench.nowNs() - t0));
+    }
+    {
+        const t0 = computeAccel.bench.nowNs();
+        spatial.bruteForceCounts(xs, ys, zs, qx, qy, qz, radius, brute_out);
+        cpu_brute_ns = @intCast(@max(0, computeAccel.bench.nowNs() - t0));
+    }
+    for (cpu_out, brute_out, 0..) |a, b, index| {
+        if (a != b) {
+            try writer.print("cpu grid/brute mismatch at query {}: {} vs {}\n", .{ index, a, b });
+            return;
+        }
+    }
+
+    const probe = computeAccel.GpuContext.probe();
+    if (!probe.available) {
+        try writer.print("gpu_webgpu: 不可用（{s}）；以上为 CPU 结果\n", .{probe.reason});
+        return;
+    }
+    const ctx = computeAccel.runtime.open() catch |err| {
+        try writer.print("gpu_webgpu: 打开设备失败（{s}）\n", .{computeAccel.gpu.lastFallbackReason() orelse @errorName(err)});
+        return;
+    };
+
+    var index = spatial.GridIndex.init(ctx, grid, point_count, query_count) catch |err| {
+        try writer.print("gpu_webgpu: 建索引失败（{s}）\n", .{computeAccel.gpu.lastFallbackReason() orelse @errorName(err)});
+        return;
+    };
+    defer index.deinit();
+
+    const gpu_out = try allocator.alloc(u32, query_count);
+    defer allocator.free(gpu_out);
+
+    // Warm-up: pipeline compilation + staging allocation must not be attributed
+    // to the measured run.
+    {
+        var chain = try computeAccel.runtime.Chain.begin(ctx);
+        defer chain.deinit();
+        try index.build(&chain, points, point_count);
+        try index.query(&chain, queries, query_count, radius);
+        try chain.download(&index.out_counts, std.mem.sliceAsBytes(gpu_out));
+        try chain.submit();
+    }
+
+    // One chain: build + query + readback (upload + single submit).
+    var gpu_once_ns: u64 = 0;
+    {
+        const t0 = computeAccel.bench.nowNs();
+        var chain = try computeAccel.runtime.Chain.begin(ctx);
+        defer chain.deinit();
+        try index.build(&chain, points, point_count);
+        try index.query(&chain, queries, query_count, radius);
+        try chain.download(&index.out_counts, std.mem.sliceAsBytes(gpu_out));
+        try chain.submit();
+        gpu_once_ns = @intCast(@max(0, computeAccel.bench.nowNs() - t0));
+    }
+
+    var verify_ok = true;
+    for (gpu_out, cpu_out) |a, b| {
+        if (a != b) verify_ok = false;
+    }
+
+    // Steady state: build once, then `samples` query-only chains (each uploads
+    // its queries, records one dispatch, reads back).
+    var query_times: [8]u64 = undefined;
+    for (0..samples) |sample| {
+        const t0 = computeAccel.bench.nowNs();
+        var chain = try computeAccel.runtime.Chain.begin(ctx);
+        defer chain.deinit();
+        try index.query(&chain, queries, query_count, radius);
+        try chain.download(&index.out_counts, std.mem.sliceAsBytes(gpu_out));
+        try chain.submit();
+        query_times[sample] = @intCast(@max(0, computeAccel.bench.nowNs() - t0));
+    }
+    std.mem.sort(u64, query_times[0..samples], {}, std.sort.asc(u64));
+    const gpu_query_ns = query_times[samples / 2];
+
+    var total_avg: f64 = 0;
+    for (cpu_out) |value| total_avg += @as(f64, @floatFromInt(value));
+    total_avg /= @as(f64, @floatFromInt(query_count));
+
+    try writer.print("backend        total(ms)   build/query(ms)             speedup vs brute   verify\n", .{});
+    try writer.print(
+        "cpu_brute      {d:>8.3}   - / {d:>8.3}                     1.00x              ref ({} checks)\n",
+        .{
+            @as(f64, @floatFromInt(cpu_brute_ns)) / 1e6,
+            @as(f64, @floatFromInt(cpu_brute_ns)) / 1e6,
+            point_count * query_count,
+        },
+    );
+    try writer.print(
+        "cpu_grid       {d:>8.3}   {d:>8.3} / {d:>8.3}                     {d:>5.1}x             OK\n",
+        .{
+            @as(f64, @floatFromInt(cpu_build_ns + cpu_query_ns)) / 1e6,
+            @as(f64, @floatFromInt(cpu_build_ns)) / 1e6,
+            @as(f64, @floatFromInt(cpu_query_ns)) / 1e6,
+            @as(f64, @floatFromInt(cpu_brute_ns)) / @as(f64, @floatFromInt(cpu_build_ns + cpu_query_ns)),
+        },
+    );
+    try writer.print(
+        "gpu_grid       {d:>8.3}   {d:>8.3} / {d:>8.3} (1 chain)        {d:>5.1}x             {s}\n",
+        .{
+            @as(f64, @floatFromInt(gpu_once_ns)) / 1e6,
+            @as(f64, @floatFromInt(gpu_once_ns)) / 1e6,
+            @as(f64, @floatFromInt(gpu_query_ns)) / 1e6,
+            @as(f64, @floatFromInt(cpu_brute_ns)) / @as(f64, @floatFromInt(gpu_once_ns)),
+            if (verify_ok) "OK" else "MISMATCH",
+        },
+    );
+    try writer.print(
+        "gpu_query      {d:>8.3}   - / {d:>8.3} (median of {})       {d:>5.1}x             OK\n",
+        .{
+            @as(f64, @floatFromInt(gpu_query_ns)) / 1e6,
+            @as(f64, @floatFromInt(gpu_query_ns)) / 1e6,
+            samples,
+            @as(f64, @floatFromInt(cpu_brute_ns)) / @as(f64, @floatFromInt(gpu_query_ns)),
+        },
+    );
+    try writer.print(
+        "avg candidates/query = {d:.1}, brute-force checks/query = {}; GPU counts == CPU grid counts (exact u32)\n",
+        .{ total_avg, point_count },
+    );
 }

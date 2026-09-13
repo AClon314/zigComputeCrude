@@ -120,6 +120,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // The demo CLI also drives the spatial module (S1); the library modules
+    // themselves stay independent (main -> both).
+    exe.root_module.addImport("computeAccel_spatial", spatial_mod);
+
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden

@@ -21,6 +21,9 @@ pub const max_downloads = 4;
 const PendingDownload = struct {
     buffer: *Buffer,
     out: []u8,
+    /// Prefix length to copy; may be shorter than the buffer (capacity-sized
+    /// buffers, e.g. an index built for `max_points` but queried with fewer).
+    byte_size: usize,
 };
 
 pub const Chain = struct {
@@ -102,14 +105,18 @@ pub const Chain = struct {
         }
     }
 
-    /// Register a readback.  The copy is recorded after all dispatches (i.e.
-    /// it reads the final state of the chain) and `out` must stay alive until
-    /// `submit` returns.
+    /// Register a readback (a prefix of the buffer is allowed).  The copy is
+    /// recorded after all dispatches (i.e. it reads the final state of the
+    /// chain) and `out` must stay alive until `submit` returns.
     pub fn download(self: *Chain, buffer: *Buffer, out: []u8) !void {
         if (self.submitted) return error.GpuError;
-        if (out.len != buffer.byte_size) return error.GpuError;
+        if (out.len == 0 or out.len > buffer.byte_size) return error.GpuError;
         if (self.download_count == self.downloads.len) return error.GpuError;
-        self.downloads[self.download_count] = .{ .buffer = buffer, .out = out };
+        self.downloads[self.download_count] = .{
+            .buffer = buffer,
+            .out = out,
+            .byte_size = out.len,
+        };
         self.download_count += 1;
     }
 
@@ -134,7 +141,7 @@ pub const Chain = struct {
                 0,
                 item.buffer.staging,
                 0,
-                @intCast(item.buffer.byte_size),
+                @intCast(item.byte_size),
             );
         }
 

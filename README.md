@@ -59,7 +59,7 @@ tools/check_abi_drift.sh            # 绑定 ABI 漂移检查（native vs emdawn
 | module | 内容 | 链接依赖 |
 |---|---|---|
 | `computeAccel` | CPU 内核、GPU 后端（native wgpu-native / browser emdawnwebgpu）、runtime（Buffer/Kernel/Chain）、GEMM/reduce 等原语、能力探测与选择 | wgpu-native 可通过 `b.dependency(..., .{ .webgpu = false })` 关闭（CPU-only 消费者） |
-| `computeAccel_spatial` | 与领域无关的空间原语（S1）：均匀网格索引（build + 半径查询，当前为 CPU 参考实现，GPU kernel 后续加入） | 无额外链接（复用 `computeAccel`） |
+| `computeAccel_spatial` | 与领域无关的空间原语（S1）：均匀网格索引（GPU build + 半径查询，与 CPU 参考逐元素对拍） | 无额外链接（复用 `computeAccel`） |
 
 `computeAccel` 内的 `primitives/` 放领域无关的并行原语（当前：`scan`），
 每个都带 CPU 参考实现与逐元素对拍测试。
@@ -157,6 +157,10 @@ zig build run -- --heuristic --size 8388608
 zig build run -- --kernel gemm --m 512 --k 512 --n 512 [--variant simple|tiled|both]
 zig build run -- --kernel reduce --size 4194304 --op sum|max
 
+# S1 空间索引：GPU 均匀网格 build + 半径查询（与 CPU 网格/暴力对拍）
+zig build run -- --kernel spatial --points 262144 --queries 4096 --radius 2.0 --iters 3
+# points 默认 65536、queries 默认 4096、radius 默认 2.0；点/查询都生成在 [0,64)^3
+
 # M0 消融：常驻 + 链式（per_call / per_submit / chained × 链长）
 zig build run -- --kernel chain --chain saxpy --size 4194304 --chain-lens 1,4,16,64 --iters 3
 zig build run -- --kernel chain --chain pipeline --m 512 --k 512 --n 512 --chain-lens 1,4,16
@@ -197,6 +201,18 @@ zig build run -- --kernel chain --chain pipeline --m 512 --k 512 --n 512 --chain
 异质链对拍用相对容差（`rel ≤ 1e-4`，实测 1.9e-6~3.7e-6，仅 f32 累加顺序差异）。
 512³ 的加速比小于 256³，因为计算占比上升、回读占比下降——这也说明链式收益与
 "每步数据量 / 计算量之比"直接相关。
+
+### S1 空间索引（ReleaseFast，4096 次查询，半径 2.0，64^3 网格）
+
+| 点数 | cpu 暴力 | cpu 网格 | gpu 网格（1 chain：build+query） | gpu 仅查询（稳态） |
+|---|---|---|---|---|
+| 16K | 55.2 ms | 3.54 ms (15.6x) | 1.55 ms (35.7x) | 0.50 ms (**111x**) |
+| 64K | 222.8 ms | 5.40 ms (41.3x) | 2.17 ms (102.5x) | 0.81 ms (**275x**) |
+| 256K | 925.5 ms | 13.3 ms (69.6x) | 6.01 ms (153.9x) | 2.58 ms (**359x**) |
+
+暴力每查询要检查全部点（256K 时 262144 次），网格每查询只检查球内候选
+（256K 时 33.5 个），所以加速随规模增长；GPU 计数与 CPU 网格计数**逐元素精确相等**
+（u32 无浮点容差问题）。build+query 在一条 Chain 里只提交一次、只回读一次。
 
 ### 内核基线（ReleaseFast，端到端含上传+回读；对拍 `max|diff| = 0`）
 
