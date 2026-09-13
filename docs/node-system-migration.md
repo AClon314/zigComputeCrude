@@ -297,6 +297,9 @@ docs/ tools/                # 保持
    属于**中间件**；本库只提供它们需要的原语与调度。`Shader nodes` 是独立的
    编译器项目，不在本库范围。
 
+**Step 9（CLI 邻接表验证，已实现）**：`--kernel spatial` 增加 K=16 邻接表验证
+（未截断的查询比较排序后的邻居集合），64K 点/4096 查询场景 4066/4096 MATCH。
+
 **Step 8（打包验证，已实现）**：新增 `examples/cpu_consumer/`（path 依赖本包、
 只 import `computeAccel`、`-Dwebgpu=false`），`zig build consumer-check` 会构建并运行它，
 并断言二进制没有链接 wgpu-native（`ldd`）；`build.zig` 增加 `-Dwgpu-lib-dir` 让发布

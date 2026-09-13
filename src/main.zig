@@ -1183,6 +1183,33 @@ fn runSpatialDemo(
     const gpu_out = try allocator.alloc(u32, query_count);
     defer allocator.free(gpu_out);
 
+    // Neighbor lists: fixed-capacity kNN output (broad-phase style).  Truncated
+    // lists are order-dependent on the GPU, so only queries whose count fits
+    // the capacity are compared (as sorted sets).
+    const max_neighbors: usize = 16;
+    const cpu_neighbors = try allocator.alloc(u32, query_count * max_neighbors);
+    defer allocator.free(cpu_neighbors);
+    const gpu_neighbors = try allocator.alloc(u32, query_count * max_neighbors);
+    defer allocator.free(gpu_neighbors);
+    const neighbor_counts = try allocator.alloc(u32, query_count);
+    defer allocator.free(neighbor_counts);
+    spatial.queryNeighbors(
+        grid,
+        xs,
+        ys,
+        zs,
+        cpu_counts,
+        cpu_offsets,
+        cpu_slots,
+        qx,
+        qy,
+        qz,
+        radius,
+        max_neighbors,
+        neighbor_counts,
+        cpu_neighbors,
+    );
+
     // Warm-up: pipeline compilation + staging allocation must not be attributed
     // to the measured run.
     {
@@ -1203,6 +1230,7 @@ fn runSpatialDemo(
         try index.build(&chain, points, point_count);
         try index.query(&chain, queries, query_count, radius);
         try chain.download(&index.out_counts, std.mem.sliceAsBytes(gpu_out));
+        try chain.download(&index.neighbors, std.mem.sliceAsBytes(gpu_neighbors));
         try chain.submit();
         gpu_once_ns = @intCast(@max(0, computeAccel.bench.nowNs() - t0));
     }
@@ -1210,6 +1238,19 @@ fn runSpatialDemo(
     var verify_ok = true;
     for (gpu_out, cpu_out) |a, b| {
         if (a != b) verify_ok = false;
+    }
+
+    var neighbors_checked: usize = 0;
+    var neighbors_ok = true;
+    for (0..query_count) |query| {
+        const count = @min(neighbor_counts[query], max_neighbors);
+        if (neighbor_counts[query] > max_neighbors) continue; // truncated: order-dependent
+        const cpu_list = cpu_neighbors[query * max_neighbors ..][0..count];
+        const gpu_list = gpu_neighbors[query * max_neighbors ..][0..count];
+        std.mem.sort(u32, cpu_list, {}, std.sort.asc(u32));
+        std.mem.sort(u32, gpu_list, {}, std.sort.asc(u32));
+        if (!std.mem.eql(u32, cpu_list, gpu_list)) neighbors_ok = false;
+        neighbors_checked += 1;
     }
 
     // Steady state: build once, then `samples` query-only chains (each uploads
@@ -1271,5 +1312,9 @@ fn runSpatialDemo(
     try writer.print(
         "avg candidates/query = {d:.1}, brute-force checks/query = {}; GPU counts == CPU grid counts (exact u32)\n",
         .{ total_avg, point_count },
+    );
+    try writer.print(
+        "neighbor lists (K={}): verified {}/{} queries as sorted sets ({s}); truncated queries skipped\n",
+        .{ max_neighbors, neighbors_checked, query_count, if (neighbors_ok) "MATCH" else "MISMATCH" },
     );
 }
