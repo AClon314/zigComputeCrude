@@ -252,8 +252,8 @@ src/
     webgpu/pipeline.zig     # KernelSpec → pipeline/bind group 缓存
   primitives/
     elementwise.zig gemm.zig reduce.zig scan.zig sort.zig
-    image/{tile,conv,pyramid,color}.zig
-    spatial/{bvh,hash,proximity}.zig
+    image/{tile,conv,pyramid}.zig      # 领域无关
+    spatial/{bvh,hash,proximity}.zig   # 按需（S1）：只在有具体消费方时新增
   determinism.zig           # exact/tolerant/fast + 每算子容差表
   selection.zig             # 现 backend.zig + bench.zig（保留为回归/自检工具）
 docs/ tools/                # 保持
@@ -274,14 +274,28 @@ docs/ tools/                # 保持
 
 ### 6.3 里程碑
 
-| 里程碑 | 内容 | 验收 |
-|---|---|---|
-| **M0 运行时**（原 Step 1/T8） | 用户持有的常驻 Buffer、`toDevice/toHost`、多 kernel 一条 command buffer、一次回读、资源池雏形 | 3 段链（如 gemm→bias→reduce）与 CPU 参考对拍；链长增加时 GPU 端到端斜率变好 |
-| **M1 通用 dispatch** | `KernelSpec` + 通用 grid/绑定 + 异步 readback + GPU timestamp | 同一 kernel 描述在 CPU/GPU 都能跑且对拍通过；加新 kernel 只写 1 WGSL + 1 spec |
-| **M2 Compositor 最小集** | 2D tile 图、逐像素/卷积/金字塔、kernel 融合、IR 雏形、色彩（先 CPU 参考） | blur→mix→color balance 类图与 Blender 参考对拍（容差）；融合前后 profile |
-| **M3 原语补齐** | atomics/scan/sort/compaction/indirect + texture/sampler/format/mip 子集 | 几何"散射/属性传播"子集 + 纹理噪声跨后端一致 |
-| **M4 Geometry 子集** | 域模型、属性传播、BVH/邻域、状态 ping-pong | 一个真实几何节点图（分布+邻近+实例化）端到端 |
-| 独立立项 | **Shader nodes**：SVM→WGSL 编译器 + 纹理/采样/导数 | 不在本库主线内，单独立项评估 |
+| 里程碑 | 归属 | 内容 | 验收 |
+|---|---|---|---|
+| **M0 运行时**（原 Step 1/T8） | 库内 ✅ | 用户持有的常驻 Buffer、`toDevice/toHost`、多 kernel 一条 command buffer、一次回读、资源池雏形 | 3 段链（如 gemm→bias→reduce）与 CPU 参考对拍；链长增加时 GPU 端到端斜率变好 |
+| **M1 通用 dispatch** | 库内 | `KernelSpec` + 通用 grid/绑定 + 异步 readback + GPU timestamp | 同一 kernel 描述在 CPU/GPU 都能跑且对拍通过；加新 kernel 只写 1 WGSL + 1 spec |
+| **M2 图像与图调度** | 库内 | 2D tile、逐像素/可分离卷积/金字塔、kernel 融合、通用 op-graph 调度（IR 雏形） | 一张融合后的图像 op-graph 与逐算子实现逐元素对拍；融合前后 profile |
+| **M2' Blender 合成节点** | 中间件 | 合成节点语义、OCIO 色彩策略、图像源/缓存 | 与 Blender 参考输出对拍；不进本库里程碑 |
+| **M3 原语补齐** | 库内 | atomics/scan/sort/compaction/indirect + texture/sampler/format/mip 子集 | 纹理噪声跨后端一致；compaction 与 CPU 对拍 |
+| **S1 空间原语（按需）** | 库内候选 | BVH 构建/遍历、空间哈希、邻域查询——**只在出现具体消费方（碰撞/几何/光追任一个）时启动**，不预埋 | 该消费方的 workload 对拍 + 消融（相对暴力解法） |
+| — | 中间件 | Blender 域模型（point/face/corner/spline/instance/volume）、属性传播语义、字段求值、Simulation/Repeat/For-Each zone、bake/cache 策略、节点解析与节点语义 | 不在本库；由消费方实现与验收 |
+| 独立立项 | 库外 | **Shader nodes**：SVM→WGSL 编译器 + 纹理/采样/导数 | 不在本库主线内，单独立项评估 |
+
+**范围边界（判断一个东西该不该进本库）**：
+
+1. 本库负责**与领域无关的并行计算**：设备运行时（常驻/链式/limits/回退）、
+   并行原语（元素级/GEMM/归约/scan/sort/纹理）、通用 op-graph 调度。
+   它不知道"节点""域""属性"是什么。
+2. 进库的门槛：**(a)** 语义不引用具体消费方（Blender/物理/渲染/碰撞）；
+   **(b)** 至少有一个明确的 workload 需要它（按需驱动，不预埋）。
+   BVH/空间哈希满足 (a)，但必须等 (b) 出现才做。
+3. 所有 Blender 语义（节点类型、域模型、属性传播、色彩策略、外部库集成）
+   属于**中间件**；本库只提供它们需要的原语与调度。`Shader nodes` 是独立的
+   编译器项目，不在本库范围。
 
 **M0 落地状态（已实现，见 README 实测）**：实际代码是 `src/runtime.zig` +
 `src/runtime/{buffer,kernel,chain}.zig`（不重命名现有 `gpu/context.zig`，用
