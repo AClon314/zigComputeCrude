@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="zh-cn">
+<head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <title>computeAccel WebGPU wasm</title>
+    <style>
+        html, body {
+            margin: 0;
+            min-height: 100%;
+            background: #101318;
+            color: #d7dde8;
+            font: 14px system-ui, sans-serif;
+        }
+        main {
+            max-width: 900px;
+            margin: 5rem auto;
+            padding: 0 1.5rem;
+        }
+        h1 { font-size: 1.25rem; }
+        #status {
+            padding: 1rem;
+            border: 1px solid #3e4b60;
+            border-radius: 0.4rem;
+            background: #171d27;
+            font: 14px ui-monospace, monospace;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }
+        #details { color: #9da9bb; line-height: 1.5; }
+    </style>
+</head>
+<body>
+    <main>
+        <h1>computeAccel — browser WebGPU backend</h1>
+        <div id="status">加载 WebGPU 中...</div>
+        <p id="details">
+            页面会先执行 CPU SIMD add，再由同一份 WGSL kernel 执行 GPU add，最后逐个
+            比较 1,048,576 个 f32。只有显示 <code>GPU add: MATCH</code> 才算通过。
+        </p>
+    </main>
+    <script type="text/javascript">
+        const statusElement = document.getElementById("status");
+        const textDecoder = new TextDecoder();
+
+        window.addEventListener("error", function (event) {
+            console.error("computeAccel page error:", event.error || event.message);
+            if (event.error || event.message) {
+                setStatus("浏览器错误: " + (event.error?.message || event.message));
+            }
+        });
+        window.addEventListener("unhandledrejection", function (event) {
+            console.error("computeAccel unhandled rejection:", event.reason);
+            setStatus("浏览器异步错误: " + event.reason);
+        });
+
+        function setStatus(text) {
+            statusElement.textContent = text;
+        }
+
+        function readWasmStatus() {
+            if (!Module._ca_wasm_status) return null;
+            const ptr = Module._ca_wasm_status() >>> 0;
+            if (!ptr) return null;
+            const heap = Module.HEAPU8 ||
+                (Module.wasmMemory && new Uint8Array(Module.wasmMemory.buffer));
+            if (!heap) return null;
+            let end = ptr;
+            const limit = Math.min(heap.length, ptr + 2048);
+            while (end < limit && heap[end] !== 0) end++;
+            return textDecoder.decode(heap.subarray(ptr, end));
+        }
+
+        function updateWasmStatus() {
+            try {
+                const status = readWasmStatus();
+                if (status) setStatus(status);
+            } catch (error) {
+                console.error("reading wasm status failed:", error);
+            }
+        }
+
+        var Module = {
+            print: function (text) { console.log(text); },
+            printErr: function (text) { console.error(text); },
+            onRuntimeInitialized: function () {
+                updateWasmStatus();
+                // main() has started ca_wasm_main().  Returning to the browser
+                // event loop lets WebGPU promises settle; this pump then
+                // delivers AllowProcessEvents callbacks.
+                function frame() {
+                    if (Module._ca_wasm_pump) Module._ca_wasm_pump();
+                    updateWasmStatus();
+                    window.requestAnimationFrame(frame);
+                }
+                window.requestAnimationFrame(frame);
+            },
+            onAbort: function (reason) {
+                setStatus("WebAssembly abort: " + reason);
+                console.error("computeAccel wasm abort:", reason);
+            },
+        };
+
+        async function initWebGPU() {
+            // Firefox on Linux exposes partial WebGPU in some builds but is
+            // not a safe target here (see the handoff and Mozilla bug 2006676).
+            var ua = navigator.userAgent;
+            var isFirefox = /Firefox\//.test(ua);
+            var isWindows = /Windows/i.test(ua);
+            if (isFirefox && !isWindows) {
+                setStatus(
+                    "Firefox 的 WebGPU 不支持当前平台（Linux 见 bugzilla 2006676），" +
+                    "请用 Chrome 打开本页面。"
+                );
+                console.warn("Skipping WebGPU init on Firefox outside Windows.");
+                return;
+            }
+
+            if (!("gpu" in navigator)) {
+                var insecure = location.protocol !== "https:" &&
+                    location.hostname !== "localhost" &&
+                    location.hostname !== "127.0.0.1";
+                setStatus(insecure
+                    ? "WebGPU 需要 https 或 localhost（当前: " +
+                      location.protocol + "//" + location.hostname + ")"
+                    : "当前浏览器不支持 WebGPU");
+                console.error("WebGPU is not available on this browser.");
+                return;
+            }
+
+            let adapter;
+            try {
+                adapter = await navigator.gpu.requestAdapter();
+            } catch (error) {
+                console.error("navigator.gpu.requestAdapter() threw:", error);
+            }
+            if (!adapter) {
+                setStatus("没有可用的 WebGPU 适配器（硬件加速被禁用？）");
+                console.error("No WebGPU adapter found.");
+                return;
+            }
+
+            // Keep the emdawnwebgpu preinitialized-device contract used by the
+            // reference addWasmStep shell.  The Zig runner deliberately uses
+            // the normal callback API so ProcessEvents remains the sole pump.
+            try {
+                Module.preinitializedWebGPUDevice = await adapter.requestDevice();
+            } catch (error) {
+                setStatus("requestDevice 失败: " + error);
+                console.error("adapter.requestDevice() threw:", error);
+                return;
+            }
+
+            setStatus("加载 computeAccel.wasm...");
+            const script = document.createElement("script");
+            script.async = true;
+            script.src = "computeAccel.js";
+            script.onerror = function (error) {
+                setStatus("加载 computeAccel.js 失败");
+                console.error("failed to load computeAccel.js:", error);
+            };
+            document.body.appendChild(script);
+        }
+
+        initWebGPU();
+    </script>
+</body>
+</html>

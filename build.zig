@@ -157,6 +157,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // Browser WebGPU is a separate emcc link: the native module above must not
+    // pull wgpu-native into the wasm object.
+    addWasmStep(b, optimize);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means
@@ -168,4 +172,87 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+}
+
+// Browser WebGPU build: Zig compiles the entry point to a wasm32-freestanding
+// object, then emcc supplies the Emscripten runtime and emdawnwebgpu symbols.
+// This intentionally mirrors ouo's addWasmStep, without SDL3 or ASYNCIFY.
+fn addWasmStep(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
+    const wasm_step = b.step(
+        "wasm",
+        "构建浏览器 WebGPU wasm: computeAccel.js + computeAccel.wasm + shell.html",
+    );
+
+    const em_cache = b.pathResolve(&.{ b.build_root.path orelse ".", ".em-cache" });
+
+    // Force emscripten to materialize the pinned remote port before the final
+    // link.  The output lives in Zig's cache rather than the source tree.
+    const fetch_port = b.addSystemCommand(&.{"emcc"});
+    fetch_port.setEnvironmentVariable("EM_CACHE", em_cache);
+    fetch_port.addArgs(&.{
+        "--use-port=deps/emdawnwebgpu.remoteport.py",
+        "-c",
+    });
+    fetch_port.addFileArg(b.path("src/bindings/web/wasm_main.c"));
+    fetch_port.addArg("-o");
+    _ = fetch_port.addOutputFileArg("emdawnwebgpu-port-probe.o");
+
+    const wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+    });
+    const wasm_webgpu_mod = b.createModule(.{
+        .root_source_file = b.path("src/gpu/webgpu.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const wasm_shader_mod = b.createModule(.{
+        .root_source_file = b.path("src/gpu/shaders/add_source.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const wasm_entry_mod = b.createModule(.{
+        .root_source_file = b.path("src/abi/wasm.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "computeAccel_gpu_webgpu", .module = wasm_webgpu_mod },
+            .{ .name = "computeAccel_add_shader", .module = wasm_shader_mod },
+        },
+    });
+    const wasm_obj = b.addObject(.{
+        .name = "computeAccel_wasm_zig",
+        .root_module = wasm_entry_mod,
+    });
+
+    const emcc_cmd = b.addSystemCommand(&.{"emcc"});
+    emcc_cmd.setEnvironmentVariable("EM_CACHE", em_cache);
+    emcc_cmd.addArgs(&.{
+        "--use-port=deps/emdawnwebgpu.remoteport.py",
+        "-sDEFAULT_TO_CXX=1",
+        "-sALLOW_MEMORY_GROWTH=1",
+        "--closure=1",
+        "-O3",
+        "-sEXPORTED_FUNCTIONS=_main,_ca_wasm_status,_ca_wasm_pump",
+        "-sEXPORTED_RUNTIME_METHODS=HEAPU8",
+        "-o",
+    });
+    const js_out = emcc_cmd.addOutputFileArg("computeAccel.js");
+    emcc_cmd.addFileArg(wasm_obj.getEmittedBin());
+    emcc_cmd.addFileArg(b.path("src/bindings/web/wasm_main.c"));
+    emcc_cmd.step.dependOn(&wasm_obj.step);
+    emcc_cmd.step.dependOn(&fetch_port.step);
+
+    const install_dir = b.addInstallDirectory(.{
+        .source_dir = js_out.dirname(),
+        .install_dir = .prefix,
+        .install_subdir = "webgpu",
+    });
+    install_dir.step.dependOn(&emcc_cmd.step);
+    wasm_step.dependOn(&install_dir.step);
+    wasm_step.dependOn(&b.addInstallFile(
+        b.path("src/bindings/web/shell.html"),
+        "webgpu/shell.html",
+    ).step);
 }

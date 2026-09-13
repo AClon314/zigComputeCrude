@@ -413,6 +413,14 @@ pub extern fn wgpuBufferGetMappedRange(
     offset: usize,
     size: usize,
 ) ?*anyopaque;
+// Browser WebGPU exposes read-only mappings through the const entry point;
+// wgpu-native provides the same webgpu.h symbol.  Keep both in this shared ABI
+// rather than maintaining a wasm-only binding fork.
+pub extern fn wgpuBufferGetConstMappedRange(
+    buffer: WGPUBuffer,
+    offset: usize,
+    size: usize,
+) ?*const anyopaque;
 pub extern fn wgpuBufferUnmap(buffer: WGPUBuffer) void;
 
 pub extern fn wgpuInstanceRelease(instance: WGPUInstance) void;

@@ -1,8 +1,9 @@
-# computeAccel — CPU / native WebGPU 计算后端 demo
+# computeAccel — CPU / native + 浏览器 WebGPU 计算后端 demo
 
 一个 Zig **0.16.0** 的最小示例，演示手动或智能选择计算后端，并把
-`add` / `saxpy` 接到本机 GPU。CPU 后端仍由 `ComputeEngine(comptime BackendType)`
-静态派发；native GPU 后端使用 wgpu-native 的 `webgpu.h` C ABI 和 WGSL。
+`add` / `saxpy` 接到 GPU。CPU 后端由 `ComputeEngine(comptime BackendType)`
+静态派发；GPU 后端使用 `webgpu.h` C ABI 和 WGSL，**同一份绑定与同一份 shader
+同时编译到 native（wgpu-native）与浏览器（emdawnwebgpu/wasm）**。
 
 ## 支持的后端
 
@@ -10,11 +11,8 @@
 |---|---|---|
 | `cpu_scalar` | ✅ | 标量循环（兜底） |
 | `cpu_simd` | ✅ | `@Vector(8, f32)` SIMD |
-| `gpu_webgpu` | ✅ native | wgpu-native v29.0.1.1；WGSL `add` / `saxpy`，运行时失败回退 CPU |
-| `gpu_cuda` | ⬜ | T1 未实现 |
-
-T1 只覆盖 native Linux wgpu-native；wasm/browser 后端属于后续 T2，本目录的
-native 改动没有引入 emcc 或浏览器路径。
+| `gpu_webgpu` | ✅ native + browser | native: wgpu-native v29.0.1.1；browser: emdawnwebgpu v20260911.162847（wasm）；WGSL `add` / `saxpy`，运行时失败回退 CPU |
+| `gpu_cuda` | ⬜ | 未实现 |
 
 ## 构建与运行
 
@@ -90,11 +88,15 @@ GPU 测试均通过。GPU 初始化失败（没有 adapter/device）时测试返
 
 ```text
 src/gpu/
-  webgpu.zig        # 手写 extern C ABI；无 @cImport
+  webgpu.zig        # 手写 extern C ABI；无 @cImport（native 与 wasm 共用）
   context.zig       # instance/adapter/device/queue、ProcessEvents pump、错误域
   pipeline.zig      # WGSL pipeline / bind group / buffer cache、dispatch、readback
   shaders/add.wgsl
   shaders/saxpy.wgsl
+  shaders/add_source.zig   # @embedFile 桥（wasm 侧用同一份 add.wgsl）
+src/abi/wasm.zig           # wasm 入口：状态机 + ca_wasm_main/pump/status
+src/bindings/web/wasm_main.c   # C main() 引用 Zig 导出（emcc 符号保留）
+src/bindings/web/shell.html    # 平台闸门 + rAF pump + 结果展示
 ```
 
 每次 GPU 运算的数据路径是：
@@ -132,6 +134,43 @@ params、staging buffer 和 bind group 都缓存在 `GpuContext` 中，不会在
 tools/check_abi_drift.sh
 # OK: 28 compute symbols identical
 ```
+
+## 浏览器 WebGPU（wasm）
+
+同一份 `src/gpu/webgpu.zig` 绑定与同一份 WGSL kernel 编译到 wasm：Zig 产出
+`wasm32-freestanding` 对象，emcc 用 emdawnwebgpu port 链接并补上 WebGPU 符号。
+
+```bash
+zig build wasm                      # -> zig-out/webgpu/{computeAccel.js,.wasm,shell.html}
+cd zig-out/webgpu && python3 -m http.server 8080
+# 用 Chrome 打开 http://127.0.0.1:8080/shell.html （localhost 也算 secure context）
+```
+
+页面会先跑 CPU SIMD `add`，再用 GPU 跑同一份 WGSL `add`，逐元素比较 1,048,576 个
+f32 并把结论写进状态文本；**只有显示 `GPU add: MATCH` 才算通过**。
+
+实测（Chrome，2026-09-13，agent-browser 抓取页面状态）：
+
+```text
+GPU add: MATCH (n=1048576, gpu=31.000 ms, cpu_simd=0.800 ms)
+```
+
+产物体积：`computeAccel.js` 14 KB、`computeAccel.wasm` 77 KB、`shell.html` 6.6 KB。
+
+### 浏览器端的关键约束
+
+- **异步只能靠 pump**：不启用 `-sASYNCIFY`，因此**不能**用 `wgpuInstanceWaitAny`
+  （emdawnwebgpu 在无 ASYNCIFY 时直接 `abort()`）。统一走
+  `WGPUCallbackMode_AllowProcessEvents` + `wgpuInstanceProcessEvents`，浏览器由页面的
+  `requestAnimationFrame` 驱动 `ca_wasm_pump()`。
+- **只能用 WGSL**：emdawnwebgpu 明确拒绝 SPIR-V（`ShaderSourceSPIRV ... not supported
+  in Wasm`），故 shader 只维护 WGSL 一份。
+- **Firefox on Linux 不支持**：`navigator.gpu` 会暴露但初始化会拖垮浏览器
+  （Mozilla bug 2006676），`shell.html` 已做 UA 闸门，直接提示改换 Chrome。
+- 需要 https 或 localhost（`navigator.gpu` 是 `[SecureContext]`）。
+- `zig build` 的日志里可能出现 `failed command: EM_CACHE=... emcc ...` —— 这是 Zig 0.16
+  在子命令向 stderr 输出内容时的前缀噪音（emcc 的 clang 版本 warning）；**以
+  `Build Summary: ... success` 与退出码为准**。
 
 ## 选择逻辑
 
