@@ -1,385 +1,216 @@
-# computeAccel — CPU / native + 浏览器 WebGPU 计算后端 demo
+# computeAccel — 可移植计算内核与常驻链式运行时（Zig + WebGPU）
 
-一个 Zig **0.16.0** 的最小示例，演示手动或智能选择计算后端，并把
-`add` / `saxpy` / `gemm` / `reduce` 接到 GPU。CPU 后端由
-`ComputeEngine(comptime BackendType)` 静态派发；GPU 后端使用 `webgpu.h` C ABI
-和 WGSL，**同一份绑定与同一份 shader 同时编译到 native（wgpu-native）与
-浏览器（emdawnwebgpu/wasm）**。
+一个 Zig 0.16 库/演示：CPU SIMD 与 WebGPU 计算共用一套内核定义，
+**同一份绑定的 C ABI 与同一份 WGSL 同时编译到 native（wgpu-native）与浏览器（emdawnwebgpu）**。
+除了逐元素/GEMM/归约内核，还提供 M0 运行时：**常驻显存 buffer + 多 dispatch 一次提交、
+一次回读**，用于把"每步一次搬运"的工作负载变成"搬一次算很多步"。
 
-## 支持的后端
+- 使用/安装：本文档（面向调用者）
+- 开发与贡献规则：`AGENTS.md`
+- 架构与后续路线（Blender 节点系统迁移评估）：`docs/node-system-migration.md`
+- 依赖说明：`deps/README.md`
 
-| BackendType | 实现状态 | 说明 |
+---
+
+## 能力现状
+
+| 层 | 内容 | 状态 |
 |---|---|---|
-| `cpu_scalar` | ✅ | 标量循环（兜底） |
-| `cpu_simd` | ✅ | `@Vector(8, f32)` SIMD |
-| `gpu_webgpu` | ✅ native + browser | native: wgpu-native v29.0.1.1；browser: emdawnwebgpu v20260911.162847（wasm）；WGSL `add` / `saxpy`，运行时失败会明确标注并回退 CPU |
-| `gpu_cuda` | ⬜ | 未实现 |
+| 后端 | `cpu_scalar`、`cpu_simd`（`@Vector`，目标自适应位宽 + `@mulAdd`）、`gpu_webgpu` | ✅ |
+| 内核 | `add`、`saxpy`、`bias_add`（广播加）、`gemm`（simple/tiled）、`reduce`（sum/max，两趟归约） | ✅ |
+| 运行时（M0） | `Buffer`（常驻 + 脏标记）、`Kernel`（WGSL+entry+binding 描述）、`Chain`（多 dispatch/一次提交/一次回读） | ✅ |
+| 选择逻辑 | `manual` / `heuristic`（阈值 + limits 闸门）/ `benchmark`（真实端到端实测） | ✅ |
+| 能力探测 | `probe()` + limits + 诚实回退（失败原因可查询，绝不把 GPU 失败算成 GPU 时间） | ✅ |
+| 未覆盖 | 纹理/采样器、indirect dispatch、atomics/scan/sort、f16/u32、BVH、多队列 | ⬜ 见 `docs/node-system-migration.md` |
 
-## 构建与运行
+约束（两端共同的底线）：只用 WGSL（浏览器拒绝 SPIR-V）、不用
+`wgpuInstanceWaitAny`/`wgpuDevicePoll`、不用 push constants/immediates、
+浏览器端不启用 ASYNCIFY（只能 `ProcessEvents` + rAF pump）。当前 GPU 路径只支持 `f32`。
 
-依赖已经放在 `vendor/wgpu-native/`（预编译的 `libwgpu_native.so`）。构建脚本会：
+---
 
-- 用 `addLibraryPath` + `linkSystemLibrary("wgpu_native")` 链接它；
-- 把 `.so` 安装到 `zig-out/lib`；
-- 给安装后的 `zig-out/bin/computeAccel` 加 `$ORIGIN/../lib` rpath，同时给测试加入 vendor rpath。
+## 安装
+
+依赖：
+
+- **Zig 0.16.0**（`zig version`）；
+- **wgpu-native**（native 端）：`tools/fetch_deps.sh` 按 `deps/pins.env` 拉到 `vendor/wgpu-native/`；
+- **Emscripten + emdawnwebgpu**（仅浏览器构建需要）：emcc 通过 remote port 自动解包到 `.em-cache/`。
 
 ```bash
-zig version                         # 0.16.0
-zig build                           # 编译并安装 bin + lib
-zig build test                      # CPU 测试 + native GPU 测试
+tools/fetch_deps.sh                 # 拉 wgpu-native（预编译 .so + 头文件）
+zig build                           # 产出 zig-out/bin/computeAccel 与 zig-out/lib/libwgpu_native.so
+zig build test                      # 全部测试（GPU 不可用时相关测试自动 Skip）
 zig build test -Doptimize=ReleaseFast
+zig build wasm                      # 浏览器版：zig-out/webgpu/{computeAccel.js,.wasm,shell.html}
+tools/check_abi_drift.sh            # 绑定 ABI 漂移检查（native vs emdawnwebgpu 头文件）
+```
 
-# 手动指定 native GPU（默认 adapter 由 Vulkan 驱动选择）
+`zig build wasm` 后可用 `cd zig-out/webgpu && python3 -m http.server 8080`，
+再用 Chrome 打开 `http://127.0.0.1:8080/shell.html`（页面会跑 CPU SIMD 与 WGSL add 并对拍，
+显示 `GPU add: MATCH` 即通过）。
+
+---
+
+## 快速开始（作为库使用）
+
+### 1. 简单路径：选后端 + 跑内核
+
+```zig
+const accel = @import("computeAccel");
+const n = 1 << 20;
+
+// 手动或自动选择（benchmark 模式会真实跑端到端并选最快）
+const backend = accel.selectBackend(allocator, .heuristic, .cpu_simd, f32, n, 20) catch .cpu_simd;
+
+var out: [n]f32 = undefined;
+accel.ComputeEngine(backend).add(f32, &out, &a, &b);
+
+// GPU 内核（失败可用 lastFallbackReason() 查询原因）
+accel.gpu.add(&out, &a, &b) catch {};             // add/saxpy
+accel.gemm.gemm(.tiled, m, k, n, a, b, out) catch {};   // GEMM simple/tiled
+accel.reduce.reduce(.sum, &scalar_out, input) catch {}; // reduce sum/max
+```
+
+### 2. 常驻 + 链式（M0 runtime，推荐用于多步工作负载）
+
+```zig
+const accel = @import("computeAccel");
+const rt = accel.runtime;
+
+const ctx = try rt.open();                       // 进程内单例设备；失败时原因在 accel.gpu.lastFallbackReason()
+
+// 常驻 buffer：CPU -> 设备只上传一次，之后由脏标记决定是否重传
+var x = try rt.Buffer.init(ctx, n * @sizeOf(f32),
+    rt.buffer.storage_rw);                       // Storage | CopyDst | CopySrc
+defer x.deinit(ctx);
+try x.toDevice(ctx, std.mem.sliceAsBytes(host_x));
+
+// 编译一个内核：WGSL + entry + binding 访问模式（write 用于脏标记）
+var kernel = try rt.Kernel.init(ctx, wgsl_source, "main", &.{
+    .{ .kind = .storage, .access = .read },
+    .{ .kind = .storage, .access = .read },
+    .{ .kind = .storage, .access = .write },
+    .{ .kind = .uniform, .access = .read },
+}, 64);
+defer kernel.deinit();
+
+const bind = try kernel.createBindGroup(&.{ &x, &y, &result, &params });
+defer rt.releaseBindGroup(bind);
+const grid = try kernel.gridLinear(n);           // 线性元素 -> 2D 展平 grid
+
+// 多步链：N 个 dispatch 录进一条 command buffer，只提交一次、只回读一次
+var chain = try rt.Chain.begin(ctx);
+defer chain.deinit();                            // 未 submit 时的清理
+for (0..steps) |_| {
+    try chain.dispatch(&kernel, bind, &.{ &x, &y, &result, &params }, grid);
+}
+try chain.download(&result, std.mem.sliceAsBytes(host_out));
+try chain.submit();
+```
+
+已验证的收益见下文「M0 消融实验」。设计原则：runtime 只做**常驻、链式、脏标记**三件事，
+不引入未经验证的抽象（见 `AGENTS.md` 的"消融优先"）。
+
+---
+
+## 命令行
+
+```bash
+# 后端选择 demo（add）
 zig build run -- --backend gpu_webgpu --size 1048576 --iters 20
-
-# 也可以指定 AMD RADV adapter；无 GPU 的机器上 GPU 测试会 skip，CLI 会回退 CPU
-VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json \
-  zig build run -- --backend gpu_webgpu --size 1048576 --iters 20
-
-# CPU 对照
-zig build run -- --backend cpu_scalar --size 1048576 --iters 20
-zig build run -- --backend cpu_simd   --size 1048576 --iters 20
 zig build run -- --auto --size 1048576
+zig build run -- --heuristic --size 8388608
 
-# GPU 新 kernel（Step 3）：GEMM 与 reduce，输出 GFLOP/s / GB/s 并与 cpu_simd 对拍
+# GEMM / reduce（输出 GFLOP/s、GB/s，并与 cpu_simd 逐元素对拍）
 zig build run -- --kernel gemm --m 512 --k 512 --n 512 [--variant simple|tiled|both]
-zig build run -Doptimize=ReleaseFast -- --kernel gemm --m 1024 --k 1024 --n 1024 --iters 5
-zig build run -- --kernel reduce --size 4194304 --op sum|max [--iters 10]
+zig build run -- --kernel reduce --size 4194304 --op sum|max
+
+# M0 消融：常驻 + 链式（per_call / per_submit / chained × 链长）
+zig build run -- --kernel chain --chain saxpy --size 4194304 --chain-lens 1,4,16,64 --iters 3
+zig build run -- --kernel chain --chain pipeline --m 512 --k 512 --n 512 --chain-lens 1,4,16
 ```
 
-CLI 的吞吐定义沿用原 demo：`2 * size * sizeof(f32) * iters / elapsed`，即按两个
-输入数组计算 GB/s，便于和 CPU 行直接比较。`gpu_webgpu` 行是端到端时间，包含输入
-上传、命令提交、结果 copy、`mapAsync`/pump 和 readback；因此简单逐元素 kernel 在
-一台带宽较低的 iGPU 上不一定超过 CPU SIMD，这个数字没有隐藏传输开销。额外的
-`gpu_batch` 行把相同输入上传一次、提交 `iters` 次真实 dispatch、最后 readback 一次，
-用于观察 steady-state kernel 吞吐；它明确标注为批量测量，不能冒充端到端结果。
+`--kernel chain --chain pipeline` 跑的是 **GEMM → bias → reduce** 四段异质链
+（三种不同内核、两种输出形状），用于验证多内核依赖顺序与"一次提交"。
 
-## 本机实测（T1 验收记录）
+---
 
-环境：AMD Radeon Vega iGPU（RADV/Vulkan；系统同时有 NVIDIA RTX 3050 Mobile），
-命令为：
+## 实测
 
-```text
-zig build run -- --backend gpu_webgpu --size 1048576 --iters 20
-```
+环境：AMD Ryzen 5 5600H + Radeon Vega iGPU（RADV/Vulkan），ReleaseFast，
+机器非独占（CPU 行有 ±10% 波动）。所有 GPU 结果都与 CPU 参考逐元素对拍，`max|diff|` 见各表说明。
 
-一次实测输出（Debug，2026-09-13）：
+### M0 消融：saxpy 链（16 MiB/buffer，超过 L3；GB/s 计 3 条流：读 x、读 y、写 x）
 
-```text
-selected backend = gpu_webgpu  (mode=manual, size=1048576, iters=20)
+| chain_len | cpu_simd | per_call | per_submit | chained | chained/cpu |
+|---|---|---|---|---|---|
+| 1 | 26.0 | 5.1 | 5.7 | 5.7 | 0.22x |
+| 4 | 37.4 | 5.4 | 15.8 | 16.6 | 0.44x |
+| 16 | 36.2 | 5.8 | 27.9 | 28.4 | 0.78x |
+| 64 | 36.3 | 6.0 | **35.0** | **35.0** | **0.96x** |
 
-backend      total_ns    throughput(GB/s)
-cpu_scalar   49793802   3.369
-cpu_simd     11431995   14.676
-speedup (scalar/simd) = 4.36x
-gpu_webgpu  36060810   4.652
-speedup (gpu/cpu_simd) = 0.32x
-gpu_batch    10324870   16.249
-speedup (gpu_batch/cpu_simd) = 1.11x
-result sample: 5.0, 5.0, 5.0, 5.0 (expected 5.0)
-```
+结论（消融）：`per_call`（旧形态：每步上传+回读）带宽恒定在 ~6 GB/s；
+`chained` 随链长增长到 ~35 GB/s，相对 per_call 提升 **5.8x**，并逼近单核 SIMD 的
+~36 GB/s —— 即"搬运被摊薄"之后，剩下的差距是这台 iGPU 与 CPU 共享内存的带宽上限，
+而不是运行时开销。`per_submit` 与 `chained` 几乎重合，说明在本机驱动上提交本身很便宜，
+**收益主要来自常驻与只回读一次**。
 
-本次 simple `add` 的 GPU 端到端吞吐为 **4.652 GB/s**，CPU SIMD 为
-**14.676 GB/s**；GPU 比 CPU 标量高 **1.38x**，端到端仍受搬运/映射开销影响。
-同一次运行的 `gpu_batch` steady-state 吞吐为 **16.249 GB/s**，相对 CPU SIMD 为
-**1.11x**；这是真实执行的 20 次 GPU dispatch，但只做一次输入上传和一次结果
-readback，故单独列出而不掩盖端到端数字。
+### M0 消融：异质链 GEMM→bias→reduce（staged = 每段各自提交+回读；chained = 一次提交）
 
-正确性和 GPU 测试还实际验证了：`size = 1<<20` 的 `add`、`saxpy` 结果都用
-`std.testing.expectEqualSlices` 分别和 `cpu_scalar`、`cpu_simd` 比较；本机两项
-GPU 测试均通过。GPU 初始化失败（没有 adapter/device）时测试返回
-`error.SkipZigTest`，而不是失败。
+| 规模 | repeats | staged | chained | 加速 | chained GFLOP/s |
+|---|---|---|---|---|---|
+| 256³ | 1 / 4 / 16 | 1.28 / 2.22 / 8.30 ms | 0.95 / 1.27 / 4.51 ms | 1.34x / 1.75x / **1.84x** | 35 / 105 / 119 |
+| 512³ | 1 / 4 / 16 | 2.90 / 8.58 / 30.75 ms | 1.97 / 6.33 / 22.70 ms | 1.47x / 1.36x / **1.35x** | 136 / 170 / 189 |
 
-## Step 3 新 kernel：GEMM 与 reduce（T5–T7）
+异质链对拍用相对容差（`rel ≤ 1e-4`，实测 1.9e-6~3.7e-6，仅 f32 累加顺序差异）。
+512³ 的加速比小于 256³，因为计算占比上升、回读占比下降——这也说明链式收益与
+"每步数据量 / 计算量之比"直接相关。
 
-| kernel | shader | 说明 |
-|---|---|---|
-| GEMM simple | `src/gpu/shaders/gemm_simple.wgsl` | 每个 invocation 算一个输出元素，只用全局内存；作为正确性基线，也是“慢”的那一版 |
-| GEMM tiled | `src/gpu/shaders/gemm_tiled.wgsl` | 64 线程/workgroup，16×16 输出 tile，A/B block 进共享内存，每线程 2×2 micro-tile；边界零填充支持任意 m/k/n |
-| reduce | `src/gpu/shaders/reduce.wgsl` | 两个 entry point（`sum_main`/`max_main`）：pass 1 每个 workgroup grid-stride 归约出 partial，pass 2 用 1 个 workgroup 收尾；workgroup 内共享内存 + barrier 树形归约 |
+### 内核基线（ReleaseFast，端到端含上传+回读；对拍 `max|diff| = 0`）
 
-调用路径：`src/gpu/gemm.zig`、`src/gpu/reduce.zig` 各自按 `(device, shape)` 缓存
-pipeline 与 buffer；`canRun(limits, ...)` 在提交前同时检查 buffer 大小与 dispatch
-grid；`maxAbsDiff` / 参考实现对拍由测试和 CLI 共用。CLI 的每个 GPU 结果都会
-逐元素与 `cpu_simd` 参考比较并打印 `max|diff|` 与 `OK/MISMATCH`。
-
-CPU 侧对比对象是自写的 **4×8 寄存器分块 SIMD**（`referenceSimd`，比朴素 i-k-j
-SIMD 快约 4 倍），**不是 BLAS/OpenBLAS**；因此下面的对比只说明“相对本项目的
-CPU kernel”。
-
-### 本机实测（Ryzen 5 5600H + Radeon Vega iGPU，ReleaseFast）
-
-GEMM 端到端包含上传 A/B、dispatch、回读 C；`batch` 是上传一次、`iters` 次真实
-dispatch、回读一次（steady-state）。所有对拍 `max|diff| = 0`。
-
-| workload | cpu_simd | gpu_simple e2e | gpu_tiled e2e | gpu_tiled batch |
+| workload | cpu_simd | gpu_simple | gpu_tiled | gpu_tiled(稳态) |
 |---|---|---|---|---|
-| 512³, iters=10 | 33.3 GFLOP/s | 79.0 (2.4x) | **173.0 (5.2x)** | 218.2 (6.6x) |
-| 1024³, iters=5 | 17.8 | 28.8 (1.6x) | **196.3 (11.0x)** | 226.8 (12.7x) |
-| 2048³, iters=3（tiled） | 12.5 | — | **215.1 (17.3x)** | 230.4 (18.5x) |
+| GEMM 512³ | 33.3 GFLOP/s | 79.0 (2.4x) | 173.0 (5.2x) | 218.2 (6.6x) |
+| GEMM 1024³ | 17.8 | 28.8 (1.6x) | 196.3 (11.0x) | 226.8 (12.7x) |
+| GEMM 2048³ | 12.5 | — | 215.1 (17.3x) | 230.4 (18.5x) |
+| reduce 4M sum | 30.5 GB/s | 6.1 (端到端) | — | 14.3 (稳态) |
+| reduce 16M sum | 25.5 | 7.0 | — | 25.1（≈打平） |
 
-（表中为 3 次运行的中位数；本机非独占，CPU 行随负载/频率有 ±10% 波动。）
+参考（历史验收，Debug）：`add` 1<<20 时 CPU SIMD 14.7 GB/s、GPU 端到端 4.7 GB/s、
+GPU 稳态 16.2 GB/s —— 这正是 M0 runtime 要解决的问题。
 
-reduce（GB/s 按输入字节）：
+**诚实结论**：GEMM 这类高算力密度内核单次就能赢；reduce/saxpy 这类纯流式 kernel
+在共享内存的 iGPU 上只能到"打平 CPU SIMD"，真正价值是**链式**（5.8x over per-call）
+而不是单步吞吐。
 
-| workload | cpu_simd | gpu e2e | gpu batch |
-|---|---|---|---|
-| 4M sum, iters=10 | 30.5 GB/s | 6.1 (0.20x) | 14.3 (0.47x) |
-| 4M max, iters=10 | 30.1 | 6.2 | 14.5 |
-| 16M sum, iters=10 | 25.5 | 7.0 (0.28x) | 25.1 (≈1.0x) |
+---
 
-诚实结论：
+## 限制与已知边界
 
-- **GEMM 是“计算量压过搬运量”的典型**：512³ 起 tiled 端到端就能明显胜出（4.7x），
-  2048³ 到 16.7x；simple 版只在 512³ 靠 L2 命中时勉强赢 CPU，1024³ 之后被 tiled
-  拉开，这正是共享内存分块优化的意义。
-- **reduce 在这台 iGPU 上不是 GPU 的菜**：它只是流式读，端到端输在“把整个输入写进
-  显存”这一趟（iGPU 与 CPU 共享同一块内存，等于白搬）；即使 batch（只上传一次）
-  在 16M 时也只与 CPU SIMD 打平（25.5 vs 25.8 GB/s），因为两边都到了内存带宽上限。
-  reduce 真正有价值的场景是数据本来就常驻显存（见路线图的 Step 1 链式 workload）。
-- `gpu_batch` 仍是 steady-state 观察项，不参与 `--auto` 选择，也不能和端到端数字混称。
+- GPU 内核目前只有 `f32`；非 f32 会走 CPU SIMD 并记录原因。
+- dispatch 的 2D 展平上限：两轴各 `maxComputeWorkgroupsPerDimension`（通常 65535），
+  limits 闸门在提交前拦截；buffer 大小同样按 `maxStorageBufferBindingSize`/`maxBufferSize` 校验。
+- 读回是**阻塞**的：`ProcessEvents` 轮询 + 30s 墙钟超时；超时会取消挂起的 mapping
+  （否则下一次提交会触发 wgpu-native 的 fatal "buffer is still mapped"）。
+- 无纹理/采样器、indirect dispatch、atomics/scan/sort、f16/u32、多队列、GPU 计时查询。
+- 浏览器端目前只跑固定 size 的 add demo；新内核移植到 wasm 需要同时过 `zig build wasm`
+  与 ABI 漂移检查。
+- `--auto`/`heuristic` 的选择只针对 `add`；GEMM/reduce/chain 是显式入口。
 
-## CPU SIMD 与 GPU kernel 为什么是两份实现
+---
 
-每个 kernel 是 **1 个 WGSL + 1 个 Zig** 的配对：
+## 开发
 
-| 侧 | 文件 | 职责 |
-|---|---|---|
-| CPU | `engine.zig`、`gemm.zig`/`reduce.zig` 里的 `reference*` | 参考实现 / 回退路径；纯 Zig 循环（带 `@Vector` SIMD） |
-| 编排 | 同一个 Zig 文件 | 编译 WGSL、建 buffer/bind group、dispatch、提交、回读、limits 校验、与 CPU 对拍 |
-| GPU | `shaders/*.wgsl` | 真正的并行运算本体（invocation / workgroup / barrier） |
+贡献规则、模块边界、依赖决策、测试门槛与提交规范见 **`AGENTS.md`**。
+架构背景（为什么要这些层、Blender 节点系统迁移需要补什么）见
+**`docs/node-system-migration.md`**。
 
-**不能合成一份源码的原因**（不是懒）：
-
-- 浏览器端（emdawnwebgpu）**只接受 WGSL**、明确拒绝 SPIR-V，所以 WGSL 这份无论如何都要有；
-- Zig 目前没有 WGSL 后端；Zig → SPIR-V 只能给 native/Vulkan 用（且本项目硬性禁用 SPIR-V），也解决不了浏览器的第二份；
-- CPU 是标量循环、GPU 是 invocation/workgroup 模型，要“一份源码两端生成”得自己写 DSL/codegen（等于小编译器），超出本 demo。
-
-所以这里的“统一”是**统一管线与约定**，而不是统一语言：
-
-- 公共 plumbing 全部收进 `GpuContext`：`createKernelPipeline` / `createStorageBuffer` /
-  `writeBytes` / `submitRecorded` / `readBuffer` / `workgroupGrid`+`canRun`；
-  `add`/`saxpy`/`gemm`/`reduce` 四条路径共用同一套（readback 只有一条实现）；
-- 每个 kernel 的 Zig 文件只剩：WGSL embed + 绑定布局 + params 结构 + dispatch/grid + CPU 参考；
-- 两份文件之间的契约就是**逐元素对拍**：同一 shape 下 WGSL 结果必须与 Zig 参考一致
-  （测试与 CLI 都打印 `max|diff|`），这也是“改了 WGSL 忘了改 Zig”能被立刻发现的原因。
-
-新增一个 kernel 的清单：
-
-1. 写 `<name>.wgsl`（定好 entry point 与 binding 顺序/类型）；
-2. 写 `src/gpu/<name>.zig`：`@embedFile`、params 的 extern struct、bind group layout、
-   按 `(device, shape)` 的 cache、`canRun` 边界、`*WithContext` 入口、CPU 参考；
-3. 加测试：CPU scalar vs SIMD（边角 shape）、GPU vs CPU（容差）；
-4. 需要 CLI/基准时，在 `main.zig` 加 `--kernel <name>` 分支与计时；
-5. `zig build test` + `zig build wasm`（不动 wasm 路径也做回归）+ `tools/check_abi_drift.sh`。
-
-## CPU SIMD 的边界：`@Vector` 会不会成为瓶颈
-
-社区里对 Zig SIMD 的批评（见 `zig-simd-bad.md`：无自动广播、无 rcp/AVX-512 特殊指令、
-无 gather/scatter/bf16/mask、`@sin` 会退化为标量循环、inline asm 不能传向量寄存器、
-位宽写死等）逐条对照本项目的 kernel：**都不适用**——我们只用 `+ * max`、访存规则
-（连续或等步长），不需要上述任何能力。但确实有两个值得修的通用点，本次已修：
-
-- **默认不生成 FMA**：Zig 严格浮点不会把 `a*b+c` 收缩为 FMA（dump asm 可见全是
-  `vmulps`+`vaddps`）。`saxpy`/GEMM 现改用 `@mulAdd`，x86 生成 `vfmadd213ps`；
-- **位宽写死**：原来硬编码 `@Vector(8, f32)`，现用 `std.simd.suggestVectorLength(f32)`
-  （本机 AVX2=8；AVX-512/NEON/wasm 自适应）。
-
-实测这两个改动的上限（临时探针，16 MiB×3 流，ReleaseFast）：
-
-| 变体 | GB/s |
-|---|---|
-| add 4-wide | 23.0 |
-| add 8-wide (AVX2) | 25.4 |
-| add 16-wide | 26.8 |
-| saxpy mul+add | 25.0 |
-| saxpy FMA | 25.4 |
-| memcpy (r+w) | 22.9 |
-| memset (w) | 26.6 |
-
-所有变体都贴在 **~23–27 GB/s 的内存带宽**上：4 宽→16 宽只有 +17%，FMA 约 +1%；
-GEMM 的 CPU 侧同样受限（加上 FMA 后在 33–35 GFLOP/s 间波动）。结论：
-**在本项目的 workload 上 Zig SIMD 不是瓶颈**，真正决定 CPU/GPU 对比的是内存带宽与
-`-Doptimize=ReleaseFast`（Debug → ReleaseFast 约 9 倍）。只有将来做 transcendental、
-稀疏（gather）、或 bf16/低精度 kernel 时，才会真正碰到那份批评清单里的限制。
-
-## native WebGPU 实现
-
-```text
-src/gpu/
-  webgpu.zig        # 手写 extern C ABI；无 @cImport（native 与 wasm 共用）
-  context.zig       # instance/device/queue、pump、错误域、limits；四条 kernel 共用的
-                    # createKernelPipeline / createStorageBuffer / writeBytes /
-                    # submitRecorded / readBuffer / workgroupGrid
-  pipeline.zig      # add/saxpy 的绑定与 dispatch
-  gemm.zig          # GEMM simple/tiled：绑定、dispatch、canRun、CPU 参考
-  reduce.zig        # reduce sum/max：两趟归约、CPU 参考
-  shaders/add.wgsl
-  shaders/saxpy.wgsl
-  shaders/gemm_simple.wgsl
-  shaders/gemm_tiled.wgsl
-  shaders/reduce.wgsl
-  shaders/add_source.zig   # @embedFile 桥（wasm 侧用同一份 add.wgsl）
-src/abi/wasm.zig           # wasm 入口：状态机 + ca_wasm_main/pump/status
-src/bindings/web/wasm_main.c   # C main() 引用 Zig 导出（emcc 符号保留）
-src/bindings/web/shell.html    # 平台闸门 + rAF pump + 结果展示
-```
-
-每次 GPU 运算的数据路径是：
-
-```text
-queueWriteBuffer(host -> storage)
-  -> compute pass (2D dispatch, workgroup_size(64))
-  -> queueSubmit
-  -> copy output -> MapRead staging
-  -> bufferMapAsync + wgpuInstanceProcessEvents pump
-  -> getMappedRange -> memcpy -> unmap
-```
-
-pipeline、pipeline layout、bind group layout，以及当前 kernel/大小对应的 storage、
-params、staging buffer 和 bind group 都缓存在 `GpuContext` 中，不会在每次 `add`
-调用时重建 shader pipeline。GEMM / reduce 各自在 `gemm.zig` / `reduce.zig` 里按
-`(device, shape)` 缓存同样的资源。越界 invocation 由 WGSL 中的 `arrayLength`
-检查挡住。当前 GPU API 对外支持 `f32`；其它 `T` 会走正确的 CPU SIMD fallback。
-
-### 限制与已知边界
-
-WebGPU 的 `maxComputeWorkgroupsPerDimension` 是**每个 dispatch 轴**的上限，不能把
-它误读成整个计算只能有 65,535 个 workgroup。本项目把线性的 workgroup 流铺成
-`x = min(limit, groups)`、`y = ceil(groups / x)` 的 2D grid；`add.wgsl` 与
-`saxpy.wgsl` 用 `num_workgroups.x` 和 `global_invocation_id.y` 还原线性下标，越界
-保护仍由原来的 `arrayLength` 判断负责。因此 `groups = 65,536` 及更大的常见输入
-不会再因为 1D dispatch 上限而回退；只要 2D grid 两轴和 buffer 大小仍在设备能力内，
-GPU 路径会正常执行。
-
-初始化时从 `wgpuAdapterGetLimits` 和 `wgpuDeviceGetLimits` 读取 limits，并把设备
-实际使用的 `maxComputeWorkgroupsPerDimension`、`maxStorageBufferBindingSize`、
-`maxBufferSize` 缓存在 `GpuContext` / `ProbeResult`。`GpuContext.canRun()` 同时检查
-这三个边界（输入、输出和 staging buffer 都必须能创建）；超过边界的请求会在提交
-前返回 GPU 错误，`heuristic` 与 `--auto` 不会把它当成可运行候选。浏览器端复用同一
-份 2D 感知 WGSL；当前 demo 固定为 `1<<20`，并且 dispatch 也走同样的 2D 形式。
-
-
-### ABI / 踩坑记录
-
-- 绑定只声明 `webgpu.h` 的 C ABI 子集，回调统一是 `callconv(.c)`，上下文只经
-  `userdata1` 传递。
-- 异步 adapter、device、map、error-scope 回调都使用
-  `WGPUCallbackMode_AllowProcessEvents`，由 `wgpuInstanceProcessEvents(instance)`
-  循环推进；**不调用也不暴露 `wgpuInstanceWaitAny`**。
-- 不使用 `wgpuDevicePoll`，shader 只用 WGSL，不传 SPIR-V。
-- readback 的等待**不能用固定的 ProcessEvents 次数当超时**：需要的泵数与排队中的
-  GPU 工作成正比（实测 1024³ 的 5 连发 GEMM 批处理让一次 4MB map 超过 10 万次
-  `wgpuInstanceProcessEvents`），固定次数会在设备仍忙时提前到期；而带 pending
-  mapping 的 buffer 再进 `wgpuQueueSubmit` 会触发 wgpu-native 的**致命** validation
-  error（`Buffer ... is still mapped`，直接 abort，error scope 捕不到）。现在
-  `GpuContext.waitFor` 用 30s 墙钟预算，超时会 `wgpuBufferUnmap` 取消挂起的映射；
-  `add` 与 `gemm`/`reduce` 两条 readback 路径都已覆盖（回归测试
-  `gemm batched long gpu work does not expire the readback wait`）。
-- C 的 `WGPU_*_INIT` 宏不能在 Zig 中直接使用；WGSL descriptor 的 chain 手写为
-  `.sType = WGPUSType_ShaderSourceWGSL`。
-- staging buffer 是 `MapRead | CopyDst`，GPU output 是 `Storage | CopySrc`；readback
-  后必须在 mapped range 仍有效时拷贝，随后立即 `unmap`。
-
-每次更新绑定后运行 ABI 漂移检查（已接进 `zig build test`，合并后会当场拦住）：
+常用命令：
 
 ```bash
-zig build test        # 含漂移检查；.em-cache 未解包时打印 SKIP（仍退出 0）
-zig build abi-check   # 严格模式：输入缺失即失败，依赖升级/CI 用
-tools/check_abi_drift.sh            # 也可单独跑
-# [abi] OK: 31 compute symbols identical
-```
-
-行为：
-
-- 逐字比对 native（`vendor/wgpu-native/include/webgpu/webgpu.h`）与 browser
-  （`.em-cache` 里解包的 emdawnwebgpu `webgpu.h`）的 compute 子集函数原型；
-- 任一符号缺失或签名不同 → **`zig build test` 失败**（exit 1）；
-- 两边头文件版本与 `deps/pins.env` 不一致 → 打 `WARN`（升级依赖后忘了重新解包的典型症状）；
-- 新环境没跑过 `zig build wasm`（`.em-cache` 为空）→ 打 `SKIP` 并提示生成方法，不阻塞测试。
-
-## 浏览器 WebGPU（wasm）
-
-同一份 `src/gpu/webgpu.zig` 绑定与同一份 WGSL kernel 编译到 wasm：Zig 产出
-`wasm32-freestanding` 对象，emcc 用 emdawnwebgpu port 链接并补上 WebGPU 符号。
-
-```bash
-zig build wasm                      # -> zig-out/webgpu/{computeAccel.js,.wasm,shell.html}
-cd zig-out/webgpu && python3 -m http.server 8080
-# 用 Chrome 打开 http://127.0.0.1:8080/shell.html （localhost 也算 secure context）
-```
-
-页面会先跑 CPU SIMD `add`，再用 GPU 跑同一份 WGSL `add`，逐元素比较 1,048,576 个
-f32 并把结论写进状态文本；**只有显示 `GPU add: MATCH` 才算通过**。
-
-实测（Chrome，2026-09-13，agent-browser 抓取页面状态）：
-
-```text
-GPU add: MATCH (n=1048576, gpu=31.000 ms, cpu_simd=0.800 ms)
-```
-
-产物体积：`computeAccel.js` 14 KB、`computeAccel.wasm` 77 KB、`shell.html` 6.6 KB。
-
-### 浏览器端的关键约束
-
-- **异步只能靠 pump**：不启用 `-sASYNCIFY`，因此**不能**用 `wgpuInstanceWaitAny`
-  （emdawnwebgpu 在无 ASYNCIFY 时直接 `abort()`）。统一走
-  `WGPUCallbackMode_AllowProcessEvents` + `wgpuInstanceProcessEvents`，浏览器由页面的
-  `requestAnimationFrame` 驱动 `ca_wasm_pump()`。
-- **只能用 WGSL**：emdawnwebgpu 明确拒绝 SPIR-V（`ShaderSourceSPIRV ... not supported
-  in Wasm`），故 shader 只维护 WGSL 一份。
-- **Firefox on Linux 不支持**：`navigator.gpu` 会暴露但初始化会拖垮浏览器
-  （Mozilla bug 2006676），`shell.html` 已做 UA 闸门，直接提示改换 Chrome。
-- 需要 https 或 localhost（`navigator.gpu` 是 `[SecureContext]`）。
-- `zig build` 的日志里可能出现 `failed command: EM_CACHE=... emcc ...` —— 这是 Zig 0.16
-  在子命令向 stderr 输出内容时的前缀噪音（emcc 的 clang 版本 warning）；**以
-  `Build Summary: ... success` 与退出码为准**。
-
-## 选择逻辑
-
-- `manual`：`--backend <name>` 是显式请求。请求 `gpu_webgpu` 不代表一定会由
-  GPU 执行；初始化或运算失败时仍保证 CPU 结果正确，并在选择行写出
-  `gpu_webgpu (fell back: <reason>)`。
-- `heuristic`：小于 `gpu_threshold = 1<<22` 时只在 CPU scalar/SIMD 中选择（`size >=
-  1024` 为 `cpu_simd`）。达到 GPU 闸门后，先调用一次缓存的
-  `GpuContext.probe()`，并同时检查 f32 字节数、2D workgroup grid 和设备 limits；
-  只有探测成功且 `canRun()` 为真才返回 `gpu_webgpu`，否则返回 `cpu_simd`。
-  这个阈值是根据本机 T1 实测确定的保守闸门：`size=1<<20` 时 GPU 端到端
-  4.652 GB/s、CPU SIMD 14.676 GB/s，不能把“有 GPU”当成“GPU 更快”。
-- `benchmark`：`--auto` 先做能力探测，然后只把探测成功的 GPU 纳入**端到端**
-  `add` bench（每次都包含上传、dispatch、copy、map/readback）；GPU 错误直接从
-  候选集中剔除，不会用 CPU fallback 的时间冒充 GPU。CLI 会说明 GPU 是否可用、
-  实测 ns 与 `cpu_simd` 的比较，以及最终为什么保留某个后端。
-- `gpu_batch` 仍是单独的 steady-state 观察项（一次上传/一次 readback、多次真实
-  dispatch），不参与 `--auto`，也不能和 CPU 的端到端数字混称。
-
-## 能力探测与回退语义
-
-`GpuContext.probe()` 在 native 进程内用线程安全的一次性缓存建立 instance、adapter、
-device 和 queue，并读取 adapter/device limits。成功与失败都缓存；失败的 `ProbeResult`
-同时提供 `failure` 枚举和稳定的 `reason` 文本，例如 instance 创建失败、limits 查询
-失败、adapter/device 请求失败或初始化回调超时。成功结果还带有实际设备的
-`maxComputeWorkgroupsPerDimension`、`maxStorageBufferBindingSize`、`maxBufferSize`，
-可用 `ProbeResult.canRun()` 预判某个请求。成功探测得到的 context 会直接供后续 GPU
-调用复用，不会“探测一次、执行时再悄悄建另一个 context”。`resetGlobal()` 仅供测试或
-明确要重试驱动环境的应用使用。
-
-低层 `computeAccel.gpu.add` / `saxpy` 保留 `!void` 错误，让调用方能区分 GPU 失败；
-`ComputeEngine(.gpu_webgpu)` 为兼容原有的 `void` API 仍会回退 `cpu_simd`，但会记录
-原因。可通过 `computeAccel.gpu.lastFallbackReason()` 查询最近一次回退；CLI 和自动
-选择不会把这条路径打印成普通 GPU 结果。对非 `f32` 类型也会明确记录“仅支持 f32”
-后回退 CPU SIMD。
-
-例如人为禁用 Vulkan ICD：
-
-```bash
-VK_ICD_FILENAMES=/nonexistent.json \
-  zig build run -- --backend gpu_webgpu --size 1048576
-```
-
-输出会保留正确的 `5.0` 结果，并类似下面明确标注原因，而不是打印普通 GPU 行：
-
-```text
-selected backend = gpu_webgpu (fell back: WebGPU device request failed or returned no device) ...
-result sample: 5.0, 5.0, 5.0, 5.0 (expected 5.0)
+zig build test --summary all        # 全绿是硬门槛
+zig build wasm                      # 浏览器路径不得回归
+tools/check_abi_drift.sh            # 改绑定后必须过
+zig build abi-check                 # 严格模式（CI / 升级依赖）
 ```

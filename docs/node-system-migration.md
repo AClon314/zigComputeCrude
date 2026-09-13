@@ -159,7 +159,8 @@
   4 宽→16 宽只有 +17%，FMA ≈ +1%。**瓶颈是带宽，不是指令集**；
 - `@Vector` 跨目标（x86 AVX2/AVX-512、ARM NEON、**wasm simd128**）由 LLVM 处理，
   这对"任意平台"（含浏览器 CPU 回退）是关键；换成 `immintrin.h` intrinsics 会失去它；
-- 社区批评（`zig-simd-bad.md`：无自动广播、无 rcp/gather/bf16/mask、inline asm 不能传向量寄存器）
+- 社区批评（Reddit r/Zig 的 “An introduction to SIMD with Zig” 讨论串：无自动广播、
+  无 rcp/gather/bf16/mask、inline asm 不能传向量寄存器）
   对我们当前算子（`+ * max` + 规则访存）**全部不适用**。
 
 工程约定：
@@ -281,6 +282,13 @@ docs/ tools/                # 保持
 | **M3 原语补齐** | atomics/scan/sort/compaction/indirect + texture/sampler/format/mip 子集 | 几何"散射/属性传播"子集 + 纹理噪声跨后端一致 |
 | **M4 Geometry 子集** | 域模型、属性传播、BVH/邻域、状态 ping-pong | 一个真实几何节点图（分布+邻近+实例化）端到端 |
 | 独立立项 | **Shader nodes**：SVM→WGSL 编译器 + 纹理/采样/导数 | 不在本库主线内，单独立项评估 |
+
+**M0 落地状态（已实现，见 README 实测）**：实际代码是 `src/runtime.zig` +
+`src/runtime/{buffer,kernel,chain}.zig`（不重命名现有 `gpu/context.zig`，用
+`runtime.Device` 别名指向它），加 `src/chain_bench.zig` 与 `--kernel chain` 消融；
+验收用 saxpy 链（per_call / per_submit / chained × 链长 1/4/16/64）和
+GEMM→bias→reduce 异质链，结果与 CPU 参考对拍。`backends/`、`primitives/` 的目录级
+重组留到 M1/M2，避免一次性大搬家掩盖行为变化。
 
 ---
 
