@@ -79,7 +79,8 @@ v2 目标布局（迁移路径见 `docs/node-system-migration.md` §6）：`runt
 `backends/{cpu,webgpu}/`、`primitives/`、`determinism.zig`、`capability.zig`。
 迁移规则：**旧的按 kernel 划分的 shape-keyed cache 逐步并入 runtime.Buffer**，
 新内核一律走 `runtime.Kernel` + `Chain`。add/saxpy 已迁移（见
-`primitives/elementwise.zig`；`gpu/pipeline.zig` 是兼容 shim），gemm/reduce 待迁。
+`primitives/elementwise.zig`；`gpu/pipeline.zig` 是兼容 shim）、gemm 已迁移
+（`gpu/gemm.zig` 的 `Kernels` 可在任意 Chain 里绑定调用），reduce 待迁。
 
 依赖方向（无环）：`root` → 各模块；`runtime` → `gpu/context` + `gpu/webgpu`；
 `chain_bench` → `runtime` + 参考实现；`gpu/*` 不反向依赖 `runtime`。

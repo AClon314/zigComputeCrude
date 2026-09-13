@@ -1,6 +1,7 @@
-//! GEMM (A[m x k] * B[k x n] = C[m x n]) — Step 3 of the GPU roadmap.
+//! GEMM (A[m x k] * B[k x n] = C[m x n]) — Step 3 of the GPU roadmap,
+//! migrated to the M0 runtime (M1).
 //!
-//! Two variants share one bind-group layout and one set of buffers:
+//! Two variants:
 //!
 //!   * `simple` — one invocation per output element, global memory only.  This
 //!     is the correctness baseline (and deliberately the slow one).
@@ -8,14 +9,14 @@
 //!     blocks staged in workgroup memory, so each input element is read from
 //!     global memory once per tile row/column instead of once per output.
 //!
-//! The GPU path allocates once per (device, shape) and reuses the pipeline,
-//! buffers and bind group across calls, matching the existing add/saxpy cache
-//! strategy.  The public `gemm`/`gemmBatched` helpers use the process-local
-//! context from `context.zig`; tests and callers that own a `GpuContext` use
-//! the `*WithContext` entry points.
+//! `Kernels` is the composable half: compiled pipelines plus a `bind` helper,
+//! usable inside any `runtime.Chain` with caller-owned buffers (this is what
+//! the heterogeneous chain demo uses).  The slice-based `gemm`/`gemmBatched`
+//! entry points keep the historical per-call behaviour (upload, dispatch,
+//! readback) on top of a device+shape buffer cache.
 
 const std = @import("std");
-const wgpu = @import("webgpu.zig");
+const runtime = @import("../runtime.zig");
 const context_mod = @import("context.zig");
 const GpuContext = context_mod.GpuContext;
 
@@ -44,64 +45,114 @@ const Params = extern struct {
     pad: u32,
 };
 
-const Cache = struct {
-    device: wgpu.WGPUDevice = null,
-    m: usize = 0,
-    k: usize = 0,
-    n: usize = 0,
+const kernel_bindings = [_]runtime.Binding{
+    .{ .kind = .storage, .access = .read }, // a
+    .{ .kind = .storage, .access = .read }, // b
+    .{ .kind = .storage, .access = .write }, // c
+    .{ .kind = .uniform, .access = .read }, // params
+};
 
-    bind_group_layout: wgpu.WGPUBindGroupLayout = null,
-    // Both variants share the bind group layout above; each slot only owns its
-    // shader module / pipeline layout / pipeline.
-    pipelines: [2]context_mod.PipelineCache = .{ .{}, .{} },
+/// Compiled pipelines for one device; buffer-agnostic and cheap to share.
+pub const Kernels = struct {
+    ctx: *runtime.Device,
+    simple: runtime.Kernel,
+    tiled: runtime.Kernel,
 
-    a: wgpu.WGPUBuffer = null,
-    b: wgpu.WGPUBuffer = null,
-    c: wgpu.WGPUBuffer = null,
-    params: wgpu.WGPUBuffer = null,
-    staging: wgpu.WGPUBuffer = null,
-    bind_group: wgpu.WGPUBindGroup = null,
-
-    fn deinitBuffers(self: *Cache) void {
-        // Bind groups reference the buffers, so they go first.
-        if (self.bind_group) |handle| wgpu.wgpuBindGroupRelease(handle);
-        self.bind_group = null;
-        for ([_]*wgpu.WGPUBuffer{ &self.a, &self.b, &self.c, &self.params, &self.staging }) |slot| {
-            if (slot.*) |handle| wgpu.wgpuBufferRelease(handle);
-            slot.* = null;
-        }
-        self.m = 0;
-        self.k = 0;
-        self.n = 0;
+    pub fn init(ctx: *runtime.Device) !Kernels {
+        var self = Kernels{
+            .ctx = ctx,
+            .simple = try runtime.Kernel.init(ctx, simple_shader, "main", &kernel_bindings, 64),
+            .tiled = undefined,
+        };
+        errdefer self.simple.deinit();
+        self.tiled = try runtime.Kernel.init(ctx, tiled_shader, "main", &kernel_bindings, 64);
+        return self;
     }
 
-    fn deinit(self: *Cache) void {
-        self.deinitBuffers();
-        for (&self.pipelines) |*slot| slot.deinit();
-        if (self.bind_group_layout) |handle| wgpu.wgpuBindGroupLayoutRelease(handle);
-        self.bind_group_layout = null;
-        self.device = null;
+    pub fn deinit(self: *Kernels) void {
+        self.tiled.deinit();
+        self.simple.deinit();
+    }
+
+    pub fn kernel(self: *const Kernels, variant: Variant) *const runtime.Kernel {
+        return if (variant == .simple) &self.simple else &self.tiled;
+    }
+
+    /// Bind group for `(a, b, c, params)` in that order.
+    pub fn bind(
+        self: *const Kernels,
+        variant: Variant,
+        a: *const runtime.Buffer,
+        b: *const runtime.Buffer,
+        c: *const runtime.Buffer,
+        params: *const runtime.Buffer,
+    ) !?*anyopaque {
+        return self.kernel(variant).createBindGroup(&.{ a, b, c, params });
     }
 };
 
-var global_cache: Cache = .{};
+const VariantCache = struct {
+    ctx: *runtime.Device,
+    shape: ValidShape,
+    a: runtime.Buffer,
+    b: runtime.Buffer,
+    c: runtime.Buffer,
+    params: runtime.Buffer,
+    binds: [2]?*anyopaque,
+
+    fn init(ctx: *runtime.Device, shape: ValidShape) !VariantCache {
+        var self = VariantCache{
+            .ctx = ctx,
+            .shape = shape,
+            .a = undefined,
+            .b = undefined,
+            .c = undefined,
+            .params = undefined,
+            .binds = .{ null, null },
+        };
+        self.a = try runtime.Buffer.init(ctx, shape.a_bytes, runtime.buffer.storage_r);
+        errdefer self.a.deinit(ctx);
+        self.b = try runtime.Buffer.init(ctx, shape.b_bytes, runtime.buffer.storage_r);
+        errdefer self.b.deinit(ctx);
+        self.c = try runtime.Buffer.init(ctx, shape.c_bytes, runtime.buffer.storage_rw);
+        errdefer self.c.deinit(ctx);
+        self.params = try runtime.Buffer.init(ctx, @sizeOf(Params), runtime.buffer.uniform);
+        errdefer self.params.deinit(ctx);
+        return self;
+    }
+
+    fn deinit(self: *VariantCache) void {
+        for (&self.binds) |*handle| {
+            if (handle.*) |bind| runtime.releaseBindGroup(bind);
+            handle.* = null;
+        }
+        self.params.deinit(self.ctx);
+        self.c.deinit(self.ctx);
+        self.b.deinit(self.ctx);
+        self.a.deinit(self.ctx);
+    }
+};
+
+var kernels_cache: ?Kernels = null;
+var shape_cache: ?VariantCache = null;
 var cache_mutex: std.atomic.Mutex = .unlocked;
 
-fn lockCache() void {
+fn lock() void {
     while (!cache_mutex.tryLock()) std.atomic.spinLoopHint();
 }
 
-fn unlockCache() void {
+fn unlock() void {
     cache_mutex.unlock();
 }
 
-/// Drop every cached GPU resource.  Tests use this to release buffers/pipelines
-/// while their own context is still alive; ordinary callers rely on the cache
-/// being rebuilt when the device or shape changes.
+/// Drop cached pipelines/buffers (tests; also after a device change).
 pub fn resetCache() void {
-    lockCache();
-    defer unlockCache();
-    global_cache.deinit();
+    lock();
+    defer unlock();
+    if (shape_cache) |*cache| cache.deinit();
+    shape_cache = null;
+    if (kernels_cache) |*kernels| kernels.deinit();
+    kernels_cache = null;
 }
 
 fn variantIndex(variant: Variant) usize {
@@ -109,10 +160,6 @@ fn variantIndex(variant: Variant) usize {
         .simple => 0,
         .tiled => 1,
     };
-}
-
-fn emptyStringView() wgpu.WGPUStringView {
-    return .{ .data = null, .length = wgpu.WGPU_STRLEN };
 }
 
 const ValidShape = struct {
@@ -162,7 +209,10 @@ pub fn canRun(limits: context_mod.GpuLimits, m: usize, k: usize, n: usize, varia
         const bytes: u64 = @intCast(byte_size);
         if (bytes > limits.maxStorageBufferBindingSize or bytes > limits.maxBufferSize) return false;
     }
+    return gridIsValid(limits, shape, variant);
+}
 
+fn gridIsValid(limits: context_mod.GpuLimits, shape: ValidShape, variant: Variant) bool {
     switch (variant) {
         .simple => {
             const groups = (@as(usize, shape.m) * shape.n + 63) / 64;
@@ -177,11 +227,16 @@ pub fn canRun(limits: context_mod.GpuLimits, m: usize, k: usize, n: usize, varia
     }
 }
 
-fn dispatchGridFor(
-    variant: Variant,
+/// Dispatch grid for a variant/shape (2D-flattened for `simple`, output tiles
+/// for `tiled`).  Exposed so callers composing their own chains can reuse it.
+pub fn gridFor(
     limits: context_mod.GpuLimits,
-    shape: ValidShape,
+    m: usize,
+    k: usize,
+    n: usize,
+    variant: Variant,
 ) !context_mod.WorkgroupGrid {
+    const shape = validateShape(m, k, n) orelse return error.GpuError;
     switch (variant) {
         .simple => {
             const groups = (@as(usize, shape.m) * shape.n + 63) / 64;
@@ -197,96 +252,40 @@ fn dispatchGridFor(
     }
 }
 
-fn ensurePipelines(ctx: *GpuContext, cache: *Cache) !void {
-    if (cache.bind_group_layout == null) {
-        var entries: [4]wgpu.WGPUBindGroupLayoutEntry = undefined;
-        for (&entries) |*entry| entry.* = std.mem.zeroes(wgpu.WGPUBindGroupLayoutEntry);
-        for (0..3) |binding| {
-            entries[binding].binding = @intCast(binding);
-            entries[binding].visibility = wgpu.WGPUShaderStage_Compute;
-            entries[binding].buffer.type = if (binding == 2)
-                wgpu.WGPUBufferBindingType_Storage
-            else
-                wgpu.WGPUBufferBindingType_ReadOnlyStorage;
-        }
-        entries[3].binding = 3;
-        entries[3].visibility = wgpu.WGPUShaderStage_Compute;
-        entries[3].buffer.type = wgpu.WGPUBufferBindingType_Uniform;
-
-        cache.bind_group_layout = try ctx.createBindGroupLayout(&wgpu.WGPUBindGroupLayoutDescriptor{
-            .nextInChain = null,
-            .label = emptyStringView(),
-            .entryCount = entries.len,
-            .entries = entries[0..].ptr,
-        });
+fn ensureKernels(ctx: *runtime.Device) !void {
+    if (kernels_cache) |*kernels| {
+        if (kernels.ctx.device == ctx.device) return;
+        kernels.deinit();
+        kernels_cache = null;
+        // Bind groups in the shape cache reference the old layouts.
+        if (shape_cache) |*cache| cache.deinit();
+        shape_cache = null;
     }
-
-    const shader_code = [2][]const u8{ simple_shader, tiled_shader };
-    for (&cache.pipelines, 0..) |*slot, index| {
-        if (slot.pipeline == null) {
-            try ctx.createKernelPipeline(slot, shader_code[index], "main", cache.bind_group_layout);
-        }
-    }
+    kernels_cache = try Kernels.init(ctx);
 }
 
-fn ensureBuffers(ctx: *GpuContext, cache: *Cache, shape: ValidShape) !void {
-    if (cache.m == @as(usize, shape.m) and
-        cache.k == @as(usize, shape.k) and
-        cache.n == @as(usize, shape.n) and
-        cache.bind_group != null)
-    {
-        return;
+fn ensureShape(ctx: *runtime.Device, shape: ValidShape) !*VariantCache {
+    if (shape_cache) |*cache| {
+        if (cache.ctx.device == ctx.device and
+            cache.shape.m == shape.m and cache.shape.k == shape.k and cache.shape.n == shape.n)
+        {
+            return cache;
+        }
+        cache.deinit();
+        shape_cache = null;
     }
 
-    cache.deinitBuffers();
-    errdefer cache.deinitBuffers();
-
-    cache.a = try ctx.createStorageBuffer(
-        shape.a_bytes,
-        wgpu.WGPUBufferUsage_Storage | wgpu.WGPUBufferUsage_CopyDst,
-    );
-    cache.b = try ctx.createStorageBuffer(
-        shape.b_bytes,
-        wgpu.WGPUBufferUsage_Storage | wgpu.WGPUBufferUsage_CopyDst,
-    );
-    cache.c = try ctx.createStorageBuffer(
-        shape.c_bytes,
-        wgpu.WGPUBufferUsage_Storage | wgpu.WGPUBufferUsage_CopySrc,
-    );
-    cache.params = try ctx.createStorageBuffer(
-        @sizeOf(Params),
-        wgpu.WGPUBufferUsage_Uniform | wgpu.WGPUBufferUsage_CopyDst,
-    );
-    cache.staging = try ctx.createStorageBuffer(
-        shape.c_bytes,
-        wgpu.WGPUBufferUsage_MapRead | wgpu.WGPUBufferUsage_CopyDst,
-    );
-
-    var entries: [4]wgpu.WGPUBindGroupEntry = undefined;
-    for (&entries) |*entry| entry.* = std.mem.zeroes(wgpu.WGPUBindGroupEntry);
-    const buffers = [4]wgpu.WGPUBuffer{ cache.a, cache.b, cache.c, cache.params };
-    for (0..4) |binding| {
-        entries[binding].binding = @intCast(binding);
-        entries[binding].buffer = buffers[binding];
-        entries[binding].offset = 0;
-        entries[binding].size = wgpu.WGPU_WHOLE_SIZE;
-    }
-    cache.bind_group = try ctx.createBindGroup(&wgpu.WGPUBindGroupDescriptor{
-        .nextInChain = null,
-        .label = emptyStringView(),
-        .layout = cache.bind_group_layout,
-        .entryCount = entries.len,
-        .entries = entries[0..].ptr,
-    });
-
-    cache.m = shape.m;
-    cache.k = shape.k;
-    cache.n = shape.n;
+    var cache = try VariantCache.init(ctx, shape);
+    errdefer cache.deinit();
+    const kernels = &kernels_cache.?;
+    cache.binds[0] = try kernels.bind(.simple, &cache.a, &cache.b, &cache.c, &cache.params);
+    cache.binds[1] = try kernels.bind(.tiled, &cache.a, &cache.b, &cache.c, &cache.params);
+    shape_cache = cache;
+    return &shape_cache.?;
 }
 
 fn runImpl(
-    ctx: *GpuContext,
-    cache: *Cache,
+    ctx: *runtime.Device,
     variant: Variant,
     m: usize,
     k: usize,
@@ -294,60 +293,41 @@ fn runImpl(
     a: []const f32,
     b: []const f32,
     out: []f32,
-    repetitions: usize,
+    iterations: usize,
 ) !void {
     const shape = validateShape(m, k, n) orelse return error.GpuError;
     if (a.len != m * k or b.len != k * n or out.len != m * n) return error.GpuError;
-    if (repetitions == 0) return error.GpuError;
+    if (iterations == 0) return error.GpuError;
     if (!canRun(ctx.limits, m, k, n, variant)) return error.GpuError;
-    const grid = try dispatchGridFor(variant, ctx.limits, shape);
 
-    if (cache.device != ctx.device) {
-        cache.deinit();
-        cache.device = ctx.device;
-    }
-    try ensurePipelines(ctx, cache);
-    try ensureBuffers(ctx, cache, shape);
+    lock();
+    defer unlock();
 
-    ctx.writeBytes(cache.a, std.mem.sliceAsBytes(a));
-    ctx.writeBytes(cache.b, std.mem.sliceAsBytes(b));
+    try ensureKernels(ctx);
+    const cache = try ensureShape(ctx, shape);
+
+    cache.a.markHostDirty();
+    try cache.a.toDevice(ctx, std.mem.sliceAsBytes(a));
+    cache.b.markHostDirty();
+    try cache.b.toDevice(ctx, std.mem.sliceAsBytes(b));
     var params = Params{ .m = shape.m, .k = shape.k, .n = shape.n, .pad = 0 };
-    ctx.writeBytes(cache.params, std.mem.asBytes(&params));
+    cache.params.markHostDirty();
+    try cache.params.toDevice(ctx, std.mem.asBytes(&params));
 
-    const index = variantIndex(variant);
-    ctx.beginErrorScope();
+    const grid = try gridFor(ctx.limits, m, k, n, variant);
+    const kernel = kernels_cache.?.kernel(variant);
+    const buffers = [4]*runtime.Buffer{ &cache.a, &cache.b, &cache.c, &cache.params };
 
-    const encoder = wgpu.wgpuDeviceCreateCommandEncoder(ctx.device, null) orelse {
-        ctx.discardErrorScope();
-        return error.GpuError;
-    };
-    for (0..repetitions) |_| {
-        const pass = wgpu.wgpuCommandEncoderBeginComputePass(encoder, null) orelse {
-            wgpu.wgpuCommandEncoderRelease(encoder);
-            ctx.discardErrorScope();
-            return error.GpuError;
-        };
-        wgpu.wgpuComputePassEncoderSetPipeline(pass, cache.pipelines[index].pipeline);
-        wgpu.wgpuComputePassEncoderSetBindGroup(pass, 0, cache.bind_group, 0, null);
-        wgpu.wgpuComputePassEncoderDispatchWorkgroups(pass, grid.x, grid.y, 1);
-        wgpu.wgpuComputePassEncoderEnd(pass);
-        wgpu.wgpuComputePassEncoderRelease(pass);
+    var chain = try runtime.Chain.begin(ctx);
+    defer chain.deinit();
+    for (0..iterations) |_| {
+        try chain.dispatch(kernel, cache.binds[variantIndex(variant)].?, &buffers, grid);
     }
-    wgpu.wgpuCommandEncoderCopyBufferToBuffer(
-        encoder,
-        cache.c,
-        0,
-        cache.staging,
-        0,
-        @intCast(shape.c_bytes),
-    );
-    try ctx.submitRecorded(encoder);
-
-    try ctx.readBuffer(cache.staging, std.mem.sliceAsBytes(out));
+    try chain.download(&cache.c, std.mem.sliceAsBytes(out));
+    try chain.submit();
 }
 
-/// Run one GEMM and read the result back.  Uses the process-local GPU context
-/// and the shared resource cache.
+/// Run one GEMM and read the result back.  Uses the process-local GPU context.
 pub fn runWithContext(
     ctx: *GpuContext,
     variant: Variant,
@@ -358,14 +338,12 @@ pub fn runWithContext(
     b: []const f32,
     out: []f32,
 ) !void {
-    lockCache();
-    defer unlockCache();
-    return runImpl(ctx, &global_cache, variant, m, k, n, a, b, out, 1);
+    return runImpl(ctx, variant, m, k, n, a, b, out, 1);
 }
 
 /// Steady-state variant: upload A/B once, run `repetitions` real dispatches,
 /// then read C back once.  Used by the benchmark to separate kernel throughput
-/// from the per-call upload/readback cost; never used by backend selection.
+/// from the per-call upload/readback cost.
 pub fn runBatchedWithContext(
     ctx: *GpuContext,
     variant: Variant,
@@ -377,9 +355,7 @@ pub fn runBatchedWithContext(
     out: []f32,
     repetitions: usize,
 ) !void {
-    lockCache();
-    defer unlockCache();
-    return runImpl(ctx, &global_cache, variant, m, k, n, a, b, out, repetitions);
+    return runImpl(ctx, variant, m, k, n, a, b, out, repetitions);
 }
 
 /// `gemm` through the comptime engine's process-local context, recording the

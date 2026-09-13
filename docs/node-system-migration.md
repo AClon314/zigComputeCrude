@@ -297,6 +297,12 @@ docs/ tools/                # 保持
    属于**中间件**；本库只提供它们需要的原语与调度。`Shader nodes` 是独立的
    编译器项目，不在本库范围。
 
+**Step 5b（M1 迁移，已实现）**：`gpu/gemm.zig` 迁到 runtime：新增 `Kernels`
+（编译好的 simple/tiled pipeline + `bind`，可在任意 Chain 里用调用方自己的 buffer
+组合）、`gridFor`（2D 展平 / tile grid）、`VariantCache`（按 device+shape 的常驻 buffer
+与两个 bind group），slice API 行为不变。实测无回退：512³ tiled 170.8 GFLOP/s e2e /
+223.2 稳态，1024³ 189.8 / 225.3（ReleaseFast，max|diff|=0）。
+
 **Step 5a（M1 迁移，已实现）**：`add`/`saxpy` 从 `gpu/pipeline.zig` 的内建
 kernel cache（`GpuContext.pipelines/resources` + `layoutEntries/ensurePipeline/
 ensureResources/dispatchMany`）迁到 runtime：新 `primitives/elementwise.zig` 只有
