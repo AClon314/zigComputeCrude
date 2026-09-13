@@ -4,12 +4,16 @@ const backend = @import("backend.zig");
 const buffer = @import("buffer.zig");
 const engine = @import("engine.zig");
 const bench_mod = @import("bench.zig");
+const gpu_context = @import("gpu/context.zig");
+const gpu_pipeline = @import("gpu/pipeline.zig");
 
 pub const BackendType = backend.BackendType;
 pub const SelectionMode = backend.SelectionMode;
 pub const DeviceBuffer = buffer.DeviceBuffer;
 pub const ComputeEngine = engine.ComputeEngine;
 pub const bench = bench_mod;
+pub const gpu = gpu_pipeline;
+pub const GpuContext = gpu_context.GpuContext;
 
 /// Compatibility helper retained for the Task 1 CLI template.
 pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
@@ -38,6 +42,8 @@ test {
     _ = buffer;
     _ = engine;
     _ = bench_mod;
+    _ = gpu_context;
+    _ = gpu_pipeline;
 }
 
 // ===== 关键 test：性能对比（scalar vs simd）=====
@@ -77,6 +83,69 @@ test "perf: simd beats scalar on large arrays" {
         try std.testing.expect(t_simd < t_scalar);
         try std.testing.expect(speedup > 1.0);
     }
+}
+
+test "gpu webgpu add matches CPU backends" {
+    const n: usize = 1 << 20;
+    const gpa = std.testing.allocator;
+
+    var context = gpu_context.GpuContext.init(gpa) catch |err| switch (err) {
+        error.GpuError => return error.SkipZigTest,
+    };
+    defer context.deinit();
+
+    const a = try gpa.alloc(f32, n);
+    defer gpa.free(a);
+    const b = try gpa.alloc(f32, n);
+    defer gpa.free(b);
+    const out_gpu = try gpa.alloc(f32, n);
+    defer gpa.free(out_gpu);
+    const out_scalar = try gpa.alloc(f32, n);
+    defer gpa.free(out_scalar);
+    const out_simd = try gpa.alloc(f32, n);
+    defer gpa.free(out_simd);
+
+    for (0..n) |i| {
+        a[i] = @as(f32, @floatFromInt(i % 97)) * 0.25;
+        b[i] = @as(f32, @floatFromInt(i % 53)) * 0.5;
+    }
+    ComputeEngine(.cpu_scalar).add(f32, out_scalar, a, b);
+    ComputeEngine(.cpu_simd).add(f32, out_simd, a, b);
+    try gpu_pipeline.addWithContext(&context, out_gpu, a, b);
+    try std.testing.expectEqualSlices(f32, out_scalar, out_simd);
+    try std.testing.expectEqualSlices(f32, out_scalar, out_gpu);
+}
+
+test "gpu webgpu saxpy matches CPU backends" {
+    const n: usize = 1 << 20;
+    const gpa = std.testing.allocator;
+
+    var context = gpu_context.GpuContext.init(gpa) catch |err| switch (err) {
+        error.GpuError => return error.SkipZigTest,
+    };
+    defer context.deinit();
+
+    const x = try gpa.alloc(f32, n);
+    defer gpa.free(x);
+    const y = try gpa.alloc(f32, n);
+    defer gpa.free(y);
+    const out_gpu = try gpa.alloc(f32, n);
+    defer gpa.free(out_gpu);
+    const out_scalar = try gpa.alloc(f32, n);
+    defer gpa.free(out_scalar);
+    const out_simd = try gpa.alloc(f32, n);
+    defer gpa.free(out_simd);
+
+    for (0..n) |i| {
+        x[i] = @as(f32, @floatFromInt(i % 97)) * 0.25;
+        y[i] = @as(f32, @floatFromInt(i % 53)) * 0.5;
+    }
+    const alpha: f32 = 1.75;
+    ComputeEngine(.cpu_scalar).saxpy(f32, alpha, out_scalar, x, y);
+    ComputeEngine(.cpu_simd).saxpy(f32, alpha, out_simd, x, y);
+    try gpu_pipeline.saxpyWithContext(&context, alpha, out_gpu, x, y);
+    try std.testing.expectEqualSlices(f32, out_scalar, out_simd);
+    try std.testing.expectEqualSlices(f32, out_scalar, out_gpu);
 }
 
 // 其它 test 块分散在 submodule，root 引用即可。

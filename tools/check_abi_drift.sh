@@ -31,7 +31,8 @@ SYMBOLS=(
     wgpuComputePipelineGetBindGroupLayout wgpuDeviceCreateBindGroupLayout
     wgpuDeviceCreateBindGroup wgpuDeviceCreatePipelineLayout
     wgpuDeviceCreateCommandEncoder wgpuCommandEncoderBeginComputePass
-    wgpuCommandEncoderFinish wgpuComputePassEncoderSetPipeline
+    wgpuCommandEncoderCopyBufferToBuffer wgpuCommandEncoderFinish
+    wgpuComputePassEncoderSetPipeline
     wgpuComputePassEncoderSetBindGroup wgpuComputePassEncoderDispatchWorkgroups
     wgpuComputePassEncoderEnd wgpuDeviceCreateBuffer wgpuQueueWriteBuffer
     wgpuQueueSubmit wgpuBufferMapAsync wgpuBufferGetMappedRange wgpuBufferUnmap

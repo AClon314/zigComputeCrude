@@ -2,6 +2,7 @@ const std = @import("std");
 const backend = @import("backend.zig");
 const buffer_mod = @import("buffer.zig");
 const engine = @import("engine.zig");
+const gpu_pipeline = @import("gpu/pipeline.zig");
 const BackendType = backend.BackendType;
 const DeviceBuffer = buffer_mod.DeviceBuffer;
 const ComputeEngine = engine.ComputeEngine;
@@ -17,6 +18,24 @@ pub fn nowNs() i128 {
 pub fn timeAdd(comptime T: type, comptime bt: BackendType, out: []T, a: []const T, b: []const T, iters: usize) u64 {
     const t0 = nowNs();
     for (0..iters) |_| ComputeEngine(bt).add(T, out, a, b);
+    const t1 = nowNs();
+    return @intCast(@max(0, t1 - t0));
+}
+
+/// Time native GPU execution without silently converting a GPU error into a
+/// CPU result.  The CLI uses this to label a real GPU measurement correctly.
+pub fn timeGpuAdd(out: []f32, a: []const f32, b: []const f32, iters: usize) !u64 {
+    const t0 = nowNs();
+    for (0..iters) |_| try gpu_pipeline.add(out, a, b);
+    const t1 = nowNs();
+    return @intCast(@max(0, t1 - t0));
+}
+
+/// Steady-state comparison: the same inputs are uploaded once, then `iters`
+/// dispatches are submitted before one staging readback.
+pub fn timeGpuAddBatched(out: []f32, a: []const f32, b: []const f32, iters: usize) !u64 {
+    const t0 = nowNs();
+    try gpu_pipeline.addBatched(out, a, b, iters);
     const t1 = nowNs();
     return @intCast(@max(0, t1 - t0));
 }

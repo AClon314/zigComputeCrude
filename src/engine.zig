@@ -1,5 +1,6 @@
 const std = @import("std");
 const backend = @import("backend.zig");
+const gpu_pipeline = @import("gpu/pipeline.zig");
 const BackendType = backend.BackendType;
 
 /// 基于 comptime 的静态派发引擎。选择 .cpu_simd 时生成的机器码只含 SIMD 循环。
@@ -17,7 +18,10 @@ pub fn ComputeEngine(comptime bt: BackendType) type {
             switch (bt) {
                 .cpu_scalar => addScalar(T, out, a, b),
                 .cpu_simd => addSimd(T, out, a, b),
-                .gpu_webgpu, .gpu_cuda => @panic("computeAccel: gpu backend not implemented in minimal demo"),
+                .gpu_webgpu => if (T == f32) {
+                    gpu_pipeline.add(out, a, b) catch addSimd(T, out, a, b);
+                } else addSimd(T, out, a, b),
+                .gpu_cuda => @panic("computeAccel: gpu_cuda backend not implemented"),
             }
         }
 
@@ -27,7 +31,10 @@ pub fn ComputeEngine(comptime bt: BackendType) type {
             switch (bt) {
                 .cpu_scalar => saxpyScalar(T, alpha, out, x, y),
                 .cpu_simd => saxpySimd(T, alpha, out, x, y),
-                .gpu_webgpu, .gpu_cuda => @panic("computeAccel: gpu backend not implemented in minimal demo"),
+                .gpu_webgpu => if (T == f32) {
+                    gpu_pipeline.saxpy(alpha, out, x, y) catch saxpySimd(T, alpha, out, x, y);
+                } else saxpySimd(T, alpha, out, x, y),
+                .gpu_cuda => @panic("computeAccel: gpu_cuda backend not implemented"),
             }
         }
     };

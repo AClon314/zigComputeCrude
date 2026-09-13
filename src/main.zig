@@ -29,11 +29,27 @@ fn addWithBackend(
     out: []f32,
     a: []const f32,
     b: []const f32,
-) void {
+) bool {
     switch (backend) {
-        .cpu_scalar => computeAccel.ComputeEngine(.cpu_scalar).add(f32, out, a, b),
-        .cpu_simd => computeAccel.ComputeEngine(.cpu_simd).add(f32, out, a, b),
-        .gpu_webgpu, .gpu_cuda => @panic("computeAccel: gpu backend not implemented in minimal demo"),
+        .cpu_scalar => {
+            computeAccel.ComputeEngine(.cpu_scalar).add(f32, out, a, b);
+            return true;
+        },
+        .cpu_simd => {
+            computeAccel.ComputeEngine(.cpu_simd).add(f32, out, a, b);
+            return true;
+        },
+        .gpu_webgpu => {
+            computeAccel.gpu.add(out, a, b) catch {
+                // A machine without a WebGPU adapter must still produce a
+                // correct result rather than turning a manual selection into a
+                // panic.
+                computeAccel.ComputeEngine(.cpu_simd).add(f32, out, a, b);
+                return false;
+            };
+            return true;
+        },
+        .gpu_cuda => return false,
     }
 }
 
@@ -155,8 +171,11 @@ pub fn main(init: std.process.Init) !void {
 
     a.toDevice();
     b.toDevice();
-    addWithBackend(chosen, res.cpu_ptr, a.cpu_ptr, b.cpu_ptr);
+    const gpu_executed = addWithBackend(chosen, res.cpu_ptr, a.cpu_ptr, b.cpu_ptr);
     res.toHost();
+    if (chosen == .gpu_webgpu and !gpu_executed) {
+        try stdout_writer.print("gpu_webgpu unavailable; used cpu_simd fallback\n", .{});
+    }
 
     const scalar_ns = computeAccel.bench.timeAdd(
         f32,
@@ -189,6 +208,48 @@ pub fn main(init: std.process.Init) !void {
         .{ simd_ns, throughputGbps(size, iters, simd_ns) },
     );
     try stdout_writer.print("speedup (scalar/simd) = {d:.2}x\n", .{speedup});
+
+    if (chosen == .gpu_webgpu and gpu_executed) {
+        const gpu_ns = computeAccel.bench.timeGpuAdd(
+            res.cpu_ptr,
+            a.cpu_ptr,
+            b.cpu_ptr,
+            iters,
+        ) catch gpu_measurement: {
+            try stdout_writer.print("gpu_webgpu measurement failed; used cpu_simd fallback\n", .{});
+            break :gpu_measurement 0;
+        };
+        if (gpu_ns != 0) {
+            const gpu_speedup = @as(f64, @floatFromInt(simd_ns)) /
+                @as(f64, @floatFromInt(gpu_ns));
+            try stdout_writer.print(
+                "gpu_webgpu  {}   {d:.3}\n",
+                .{ gpu_ns, throughputGbps(size, iters, gpu_ns) },
+            );
+            try stdout_writer.print("speedup (gpu/cpu_simd) = {d:.2}x\n", .{gpu_speedup});
+        }
+
+        if (iters > 1) {
+            const batch_ns = computeAccel.bench.timeGpuAddBatched(
+                res.cpu_ptr,
+                a.cpu_ptr,
+                b.cpu_ptr,
+                iters,
+            ) catch gpu_batch_measurement: {
+                try stdout_writer.print("gpu batch measurement failed\n", .{});
+                break :gpu_batch_measurement 0;
+            };
+            if (batch_ns != 0) {
+                const batch_speedup = @as(f64, @floatFromInt(simd_ns)) /
+                    @as(f64, @floatFromInt(batch_ns));
+                try stdout_writer.print(
+                    "gpu_batch    {}   {d:.3}\n",
+                    .{ batch_ns, throughputGbps(size, iters, batch_ns) },
+                );
+                try stdout_writer.print("speedup (gpu_batch/cpu_simd) = {d:.2}x\n", .{batch_speedup});
+            }
+        }
+    }
 
     try stdout_writer.print("result sample:", .{});
     const sample_count = @min(size, 4);

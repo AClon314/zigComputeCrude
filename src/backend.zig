@@ -15,11 +15,12 @@ pub const BackendType = enum {
         };
     }
 
-    /// 本 demo 真正实现的是两个 CPU 后端。
+    /// gpu_webgpu is a native wgpu-native implementation.  Its runtime
+    /// initialization is still fallible; callers must retain the CPU fallback.
     pub fn isImplemented(self: BackendType) bool {
         return switch (self) {
-            .cpu_scalar, .cpu_simd => true,
-            .gpu_webgpu, .gpu_cuda => false,
+            .cpu_scalar, .cpu_simd, .gpu_webgpu => true,
+            .gpu_cuda => false,
         };
     }
 };
@@ -35,6 +36,7 @@ pub fn heuristic(size: usize) BackendType {
 test "backend enum basics" {
     try std.testing.expectEqualStrings("cpu_simd", BackendType.cpu_simd.name());
     try std.testing.expect(BackendType.cpu_scalar.isImplemented());
+    try std.testing.expect(BackendType.gpu_webgpu.isImplemented());
     try std.testing.expect(!BackendType.gpu_cuda.isImplemented());
     try std.testing.expectEqual(BackendType.cpu_simd, heuristic(4096));
     try std.testing.expectEqual(BackendType.cpu_scalar, heuristic(128));

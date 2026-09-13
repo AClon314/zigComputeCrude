@@ -39,7 +39,22 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        .link_libc = target.result.os.tag == .linux,
     });
+
+    // T1 is the native Linux backend. Keep the WebGPU library on the module so
+    // both the executable and its test artifact resolve the hand-written C ABI.
+    // The absolute build-tree rpath makes `zig build test` work, while the
+    // installed rpath plus copied .so makes `zig build run` relocatable under
+    // zig-out/{bin,lib}.
+    if (target.result.os.tag == .linux) {
+        const wgpu_lib_dir = b.path("vendor/wgpu-native/lib");
+        mod.addLibraryPath(wgpu_lib_dir);
+        mod.linkSystemLibrary("wgpu_native", .{ .use_pkg_config = .no });
+        mod.addRPath(wgpu_lib_dir);
+        mod.addRPathSpecial("$ORIGIN/../lib");
+        b.installFile("vendor/wgpu-native/lib/libwgpu_native.so", "lib/libwgpu_native.so");
+    }
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
