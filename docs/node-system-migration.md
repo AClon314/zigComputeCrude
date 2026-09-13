@@ -297,6 +297,13 @@ docs/ tools/                # 保持
    属于**中间件**；本库只提供它们需要的原语与调度。`Shader nodes` 是独立的
    编译器项目，不在本库范围。
 
+**Step 1（模块化，已实现）**：发布形态拆成一个包两个 module——
+`computeAccel`（CPU/GPU/runtime/原语）与 `computeAccel_spatial`（S1 空间原语），
+配套 `zig build tree-shake` 门禁（CPU-only 消费者对象 10,792 B、0 个 wgpu/WGSL 符号；
+含 GPU 引用时 201,872 B、42 个 wgpu 符号）。后续新领域一律新增 module，
+主 module 不反向依赖。当前 `computeAccel_spatial` 已有 CPU 参考实现
+（均匀网格 build + 半径查询），GPU 版本（atomics + scan + scatter）是下一步。
+
 **M0 落地状态（已实现，见 README 实测）**：实际代码是 `src/runtime.zig` +
 `src/runtime/{buffer,kernel,chain}.zig`（不重命名现有 `gpu/context.zig`，用
 `runtime.Device` 别名指向它），加 `src/chain_bench.zig` 与 `--kernel chain` 消融；

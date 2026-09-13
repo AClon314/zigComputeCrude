@@ -16,6 +16,15 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+    // Whether to link wgpu-native.  Consumers that only use the CPU kernels can
+    // pass `.webgpu = false` to `b.dependency(...)`; their build then needs no
+    // wgpu-native .so/headers.  The GPU code is never *compiled* unless
+    // referenced, this only removes the link step.
+    const webgpu_enabled = b.option(
+        bool,
+        "webgpu",
+        "link wgpu-native (native WebGPU backend); set false for CPU-only consumers",
+    ) orelse true;
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -47,7 +56,7 @@ pub fn build(b: *std.Build) void {
     // The absolute build-tree rpath makes `zig build test` work, while the
     // installed rpath plus copied .so makes `zig build run` relocatable under
     // zig-out/{bin,lib}.
-    if (target.result.os.tag == .linux) {
+    if (target.result.os.tag == .linux and webgpu_enabled) {
         const wgpu_lib_dir = b.path("vendor/wgpu-native/lib");
         mod.addLibraryPath(wgpu_lib_dir);
         mod.linkSystemLibrary("wgpu_native", .{ .use_pkg_config = .no });
@@ -55,6 +64,19 @@ pub fn build(b: *std.Build) void {
         mod.addRPathSpecial("$ORIGIN/../lib");
         b.installFile("vendor/wgpu-native/lib/libwgpu_native.so", "lib/libwgpu_native.so");
     }
+
+    // Spatial primitives (S1) live in their own module: a consumer that never
+    // imports it does not compile it (and it deliberately has no GPU link of
+    // its own; it uses the core module's runtime when it needs the GPU).
+    const spatial_mod = b.addModule("computeAccel_spatial", .{
+        .root_source_file = b.path("src/spatial.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = target.result.os.tag == .linux,
+        .imports = &.{
+            .{ .name = "computeAccel", .module = mod },
+        },
+    });
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -156,6 +178,32 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // Spatial module tests (S1).
+    const spatial_tests = b.addTest(.{ .root_module = spatial_mod });
+    const run_spatial_tests = b.addRunArtifact(spatial_tests);
+    test_step.dependOn(&run_spatial_tests.step);
+
+    // Tree-shake guard: a CPU-only consumer of `computeAccel` must not compile
+    // the WebGPU backend nor the spatial module.  This is the build-time
+    // promise behind the multi-module layout (docs/node-system-migration.md).
+    const shake_mod = b.createModule(.{
+        .root_source_file = b.path("tools/tree_shake_probe.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = target.result.os.tag == .linux,
+        .imports = &.{
+            .{ .name = "computeAccel", .module = mod },
+        },
+    });
+    const shake_obj = b.addObject(.{ .name = "tree_shake_probe", .root_module = shake_mod });
+    const shake_check = b.addSystemCommand(&.{"bash"});
+    shake_check.addFileArg(b.path("tools/check_tree_shake.sh"));
+    shake_check.addFileArg(shake_obj.getEmittedBin());
+    test_step.dependOn(&shake_check.step);
+
+    const tree_shake_step = b.step("tree-shake", "断言 CPU-only 消费者不编译 GPU/空间模块");
+    tree_shake_step.dependOn(&shake_check.step);
 
     // ABI 漂移检查：native(wgpu-native) 与 browser(emdawnwebgpu) 的 webgpu.h
     // 在 compute 子集上必须逐字一致 —— 这是「一套绑定编两个目标」的护栏，

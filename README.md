@@ -14,14 +14,14 @@
 
 ## 能力现状
 
-| 层 | 内容 | 状态 |
-|---|---|---|
-| 后端 | `cpu_scalar`、`cpu_simd`（`@Vector`，目标自适应位宽 + `@mulAdd`）、`gpu_webgpu` | ✅ |
-| 内核 | `add`、`saxpy`、`bias_add`（广播加）、`gemm`（simple/tiled）、`reduce`（sum/max，两趟归约） | ✅ |
-| 运行时（M0） | `Buffer`（常驻 + 脏标记）、`Kernel`（WGSL+entry+binding 描述）、`Chain`（多 dispatch/一次提交/一次回读） | ✅ |
-| 选择逻辑 | `manual` / `heuristic`（阈值 + limits 闸门）/ `benchmark`（真实端到端实测） | ✅ |
-| 能力探测 | `probe()` + limits + 诚实回退（失败原因可查询，绝不把 GPU 失败算成 GPU 时间） | ✅ |
-| 未覆盖 | 纹理/采样器、indirect dispatch、atomics/scan/sort、f16/u32、BVH、多队列 | ⬜ 见 `docs/node-system-migration.md` |
+| 层           | 内容                                                                                                     | 状态                                  |
+| ------------ | -------------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| 后端         | `cpu_scalar`、`cpu_simd`（`@Vector`，目标自适应位宽 + `@mulAdd`）、`gpu_webgpu`                          | ✅                                    |
+| 内核         | `add`、`saxpy`、`bias_add`（广播加）、`gemm`（simple/tiled）、`reduce`（sum/max，两趟归约）              | ✅                                    |
+| 运行时（M0） | `Buffer`（常驻 + 脏标记）、`Kernel`（WGSL+entry+binding 描述）、`Chain`（多 dispatch/一次提交/一次回读） | ✅                                    |
+| 选择逻辑     | `manual` / `heuristic`（阈值 + limits 闸门）/ `benchmark`（真实端到端实测）                              | ✅                                    |
+| 能力探测     | `probe()` + limits + 诚实回退（失败原因可查询，绝不把 GPU 失败算成 GPU 时间）                            | ✅                                    |
+| 未覆盖       | 纹理/采样器、indirect dispatch、atomics/scan/sort、f16/u32、BVH、多队列                                  | ⬜ 见 `docs/node-system-migration.md` |
 
 约束（两端共同的底线）：只用 WGSL（浏览器拒绝 SPIR-V）、不用
 `wgpuInstanceWaitAny`/`wgpuDevicePoll`、不用 push constants/immediates、
@@ -51,6 +51,34 @@ tools/check_abi_drift.sh            # 绑定 ABI 漂移检查（native vs emdawn
 显示 `GPU add: MATCH` 即通过）。
 
 ---
+
+## 模块（发布形态）
+
+一个包（`build.zig.zon`）暴露两个 module，按需引入：
+
+| module | 内容 | 链接依赖 |
+|---|---|---|
+| `computeAccel` | CPU 内核、GPU 后端（native wgpu-native / browser emdawnwebgpu）、runtime（Buffer/Kernel/Chain）、GEMM/reduce 等原语、能力探测与选择 | wgpu-native 可通过 `b.dependency(..., .{ .webgpu = false })` 关闭（CPU-only 消费者） |
+| `computeAccel_spatial` | 与领域无关的空间原语（S1）：均匀网格索引（build + 半径查询，当前为 CPU 参考实现，GPU kernel 后续加入） | 无额外链接（复用 `computeAccel`） |
+
+```zig
+// 消费者 build.zig
+const accel = b.dependency("computeAccel", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("computeAccel", accel.module("computeAccel"));
+exe.root_module.addImport("computeAccel_spatial", accel.module("computeAccel_spatial")); // 可选
+```
+
+Zig 是**惰性分析**：没被引用的声明（函数/类型/泛型实例/整个文件）不会被语义分析，
+更不会进入产物——所以未使用的 module/内核零成本，不需要 TS 那种 `sideEffects` 注解。
+仓库自带门禁验证这一点：
+
+```bash
+zig build tree-shake      # CPU-only 消费者的目标文件必须 0 个 wgpu/WGSL/spatial 符号
+```
+
+本机实测（ReleaseFast）：只调用 CPU add 的消费者对象 **10,792 B**（0 wgpu 符号、0 WGSL 文本）；
+同一消费者加上 `accel.gpu.add` 后 **201,872 B**（42 个 wgpu 符号、1 份内嵌 WGSL）。
+脚本：`tools/check_tree_shake.sh`。
 
 ## 快速开始（作为库使用）
 
@@ -143,12 +171,12 @@ zig build run -- --kernel chain --chain pipeline --m 512 --k 512 --n 512 --chain
 
 ### M0 消融：saxpy 链（16 MiB/buffer，超过 L3；GB/s 计 3 条流：读 x、读 y、写 x）
 
-| chain_len | cpu_simd | per_call | per_submit | chained | chained/cpu |
-|---|---|---|---|---|---|
-| 1 | 26.0 | 5.1 | 5.7 | 5.7 | 0.22x |
-| 4 | 37.4 | 5.4 | 15.8 | 16.6 | 0.44x |
-| 16 | 36.2 | 5.8 | 27.9 | 28.4 | 0.78x |
-| 64 | 36.3 | 6.0 | **35.0** | **35.0** | **0.96x** |
+| chain_len | cpu_simd | per_call | per_submit | chained  | chained/cpu |
+| --------- | -------- | -------- | ---------- | -------- | ----------- |
+| 1         | 26.0     | 5.1      | 5.7        | 5.7      | 0.22x       |
+| 4         | 37.4     | 5.4      | 15.8       | 16.6     | 0.44x       |
+| 16        | 36.2     | 5.8      | 27.9       | 28.4     | 0.78x       |
+| 64        | 36.3     | 6.0      | **35.0**   | **35.0** | **0.96x**   |
 
 结论（消融）：`per_call`（旧形态：每步上传+回读）带宽恒定在 ~6 GB/s；
 `chained` 随链长增长到 ~35 GB/s，相对 per_call 提升 **5.8x**，并逼近单核 SIMD 的
@@ -158,9 +186,9 @@ zig build run -- --kernel chain --chain pipeline --m 512 --k 512 --n 512 --chain
 
 ### M0 消融：异质链 GEMM→bias→reduce（staged = 每段各自提交+回读；chained = 一次提交）
 
-| 规模 | repeats | staged | chained | 加速 | chained GFLOP/s |
-|---|---|---|---|---|---|
-| 256³ | 1 / 4 / 16 | 1.28 / 2.22 / 8.30 ms | 0.95 / 1.27 / 4.51 ms | 1.34x / 1.75x / **1.84x** | 35 / 105 / 119 |
+| 规模 | repeats    | staged                 | chained                | 加速                      | chained GFLOP/s |
+| ---- | ---------- | ---------------------- | ---------------------- | ------------------------- | --------------- |
+| 256³ | 1 / 4 / 16 | 1.28 / 2.22 / 8.30 ms  | 0.95 / 1.27 / 4.51 ms  | 1.34x / 1.75x / **1.84x** | 35 / 105 / 119  |
 | 512³ | 1 / 4 / 16 | 2.90 / 8.58 / 30.75 ms | 1.97 / 6.33 / 22.70 ms | 1.47x / 1.36x / **1.35x** | 136 / 170 / 189 |
 
 异质链对拍用相对容差（`rel ≤ 1e-4`，实测 1.9e-6~3.7e-6，仅 f32 累加顺序差异）。
@@ -169,13 +197,13 @@ zig build run -- --kernel chain --chain pipeline --m 512 --k 512 --n 512 --chain
 
 ### 内核基线（ReleaseFast，端到端含上传+回读；对拍 `max|diff| = 0`）
 
-| workload | cpu_simd | gpu_simple | gpu_tiled | gpu_tiled(稳态) |
-|---|---|---|---|---|
-| GEMM 512³ | 33.3 GFLOP/s | 79.0 (2.4x) | 173.0 (5.2x) | 218.2 (6.6x) |
-| GEMM 1024³ | 17.8 | 28.8 (1.6x) | 196.3 (11.0x) | 226.8 (12.7x) |
-| GEMM 2048³ | 12.5 | — | 215.1 (17.3x) | 230.4 (18.5x) |
-| reduce 4M sum | 30.5 GB/s | 6.1 (端到端) | — | 14.3 (稳态) |
-| reduce 16M sum | 25.5 | 7.0 | — | 25.1（≈打平） |
+| workload       | cpu_simd     | gpu_simple   | gpu_tiled     | gpu_tiled(稳态) |
+| -------------- | ------------ | ------------ | ------------- | --------------- |
+| GEMM 512³      | 33.3 GFLOP/s | 79.0 (2.4x)  | 173.0 (5.2x)  | 218.2 (6.6x)    |
+| GEMM 1024³     | 17.8         | 28.8 (1.6x)  | 196.3 (11.0x) | 226.8 (12.7x)   |
+| GEMM 2048³     | 12.5         | —            | 215.1 (17.3x) | 230.4 (18.5x)   |
+| reduce 4M sum  | 30.5 GB/s    | 6.1 (端到端) | —             | 14.3 (稳态)     |
+| reduce 16M sum | 25.5         | 7.0          | —             | 25.1（≈打平）   |
 
 参考（历史验收，Debug）：`add` 1<<20 时 CPU SIMD 14.7 GB/s、GPU 端到端 4.7 GB/s、
 GPU 稳态 16.2 GB/s —— 这正是 M0 runtime 要解决的问题。
@@ -202,7 +230,7 @@ GPU 稳态 16.2 GB/s —— 这正是 M0 runtime 要解决的问题。
 
 ## 开发
 
-贡献规则、模块边界、依赖决策、测试门槛与提交规范见 **`AGENTS.md`**。
+贡献规则、模块边界、依赖决策、测试门槛与提交规范见 [AGENTS.md](./AGENTS.md)。
 架构背景（为什么要这些层、Blender 节点系统迁移需要补什么）见
 **`docs/node-system-migration.md`**。
 

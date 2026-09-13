@@ -47,6 +47,17 @@ Blender/节点的语义（域模型、属性传播、节点图求值、色彩/�
 
 ## 3. 模块边界（现状 → v2 目标）
 
+**发布形态**：一个包，多个 module（`build.zig` 的 `addModule`）：
+
+| module | 归属内容 | 规则 |
+|---|---|---|
+| `computeAccel` | CPU 内核、GPU 后端、runtime、通用原语、探测/选择 | wgpu 链接可用 `-Dwebgpu=false` 关掉；不得 import `computeAccel_spatial` |
+| `computeAccel_spatial` | 领域无关的空间原语（S1） | 只能依赖 `computeAccel` 的公开 API；不得被主 module 反向 import |
+
+新增一类功能（图像、物理、其他域）= **新增一个 module**，不要塞进主 module。
+每次新增 module 都要同步 `tools/tree_shake_probe.zig` 的断言清单（保证"未引用即不编译"）。
+
+
 现状（可直接使用）：
 
 ```
@@ -91,10 +102,15 @@ v2 目标布局（迁移路径见 `docs/node-system-migration.md` §6）：`runt
 ## 5. 测试与验收门槛（缺一不可）
 
 ```bash
-zig build test --summary all     # 全绿（含 ABI 检查；GPU 测试允许 Skip）
+zig build test --summary all     # 全绿（含 ABI 检查与 tree-shake 门禁；GPU 测试允许 Skip）
 zig build wasm                   # 成功（浏览器路径不回归）
 tools/check_abi_drift.sh         # OK
+zig build tree-shake             # CPU-only 消费者产物无 wgpu/WGSL/spatial 符号
 ```
+
+tree-shake 门禁有正负两侧：`build.zig` 里的 probe 只调用 CPU 路径（必须过）；
+负例可直接用手工构造的含 GPU 对象验证脚本确实会失败
+（`tools/check_tree_shake.sh <object-with-gpu-code>` 必须 exit 1）。
 
 - 改 GPU 路径后要跑一遍真实 CLI/消融（`--kernel gemm|reduce|chain`），
   确认没有回退、验证 `max|diff|`/`rel diff`。
