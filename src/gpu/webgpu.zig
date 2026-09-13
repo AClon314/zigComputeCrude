@@ -179,6 +179,46 @@ pub const WGPUAdapterInfo = extern struct {
     subgroupMaxSize: u32,
 };
 
+/// ABI mirror of WGPULimits from both the native and emdawnwebgpu headers.
+/// Keep every field, including limits this backend does not currently use, so
+/// wgpuAdapterGetLimits/wgpuDeviceGetLimits can fill the complete output
+/// struct without an offset mismatch.
+pub const WGPULimits = extern struct {
+    nextInChain: ?*WGPUChainedStruct,
+    maxTextureDimension1D: u32,
+    maxTextureDimension2D: u32,
+    maxTextureDimension3D: u32,
+    maxTextureArrayLayers: u32,
+    maxBindGroups: u32,
+    maxBindGroupsPlusVertexBuffers: u32,
+    maxBindingsPerBindGroup: u32,
+    maxDynamicUniformBuffersPerPipelineLayout: u32,
+    maxDynamicStorageBuffersPerPipelineLayout: u32,
+    maxSampledTexturesPerShaderStage: u32,
+    maxSamplersPerShaderStage: u32,
+    maxStorageBuffersPerShaderStage: u32,
+    maxStorageTexturesPerShaderStage: u32,
+    maxUniformBuffersPerShaderStage: u32,
+    maxUniformBufferBindingSize: u64,
+    maxStorageBufferBindingSize: u64,
+    minUniformBufferOffsetAlignment: u32,
+    minStorageBufferOffsetAlignment: u32,
+    maxVertexBuffers: u32,
+    maxBufferSize: u64,
+    maxVertexAttributes: u32,
+    maxVertexBufferArrayStride: u32,
+    maxInterStageShaderVariables: u32,
+    maxColorAttachments: u32,
+    maxColorAttachmentBytesPerSample: u32,
+    maxComputeWorkgroupStorageSize: u32,
+    maxComputeInvocationsPerWorkgroup: u32,
+    maxComputeWorkgroupSizeX: u32,
+    maxComputeWorkgroupSizeY: u32,
+    maxComputeWorkgroupSizeZ: u32,
+    maxComputeWorkgroupsPerDimension: u32,
+    maxImmediateSize: u32,
+};
+
 pub const WGPUBufferDescriptor = extern struct {
     nextInChain: ?*WGPUChainedStruct,
     label: WGPUStringView,
@@ -315,8 +355,10 @@ pub extern fn wgpuAdapterRequestDevice(
 ) WGPUFuture;
 pub extern fn wgpuAdapterGetInfo(adapter: WGPUAdapter, info: *WGPUAdapterInfo) WGPUStatus;
 pub extern fn wgpuAdapterInfoFreeMembers(info: WGPUAdapterInfo) void;
+pub extern fn wgpuAdapterGetLimits(adapter: WGPUAdapter, limits: *WGPULimits) WGPUStatus;
 
 pub extern fn wgpuDeviceGetQueue(device: WGPUDevice) WGPUQueue;
+pub extern fn wgpuDeviceGetLimits(device: WGPUDevice, limits: *WGPULimits) WGPUStatus;
 pub extern fn wgpuDevicePushErrorScope(device: WGPUDevice, filter: WGPUErrorFilter) void;
 pub extern fn wgpuDevicePopErrorScope(
     device: WGPUDevice,

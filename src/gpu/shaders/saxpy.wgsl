@@ -15,8 +15,12 @@ var<storage, read_write> result: array<f32>;
 var<uniform> params: Params;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
+fn main(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups: vec3<u32>,
+) {
+    let row_width = num_workgroups.x * 64u;
+    let i = global_id.x + global_id.y * row_width;
     if (i >= arrayLength(&x)) {
         return;
     }

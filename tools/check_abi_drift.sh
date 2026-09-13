@@ -26,7 +26,8 @@ fi
 SYMBOLS=(
     wgpuCreateInstance wgpuInstanceProcessEvents
     wgpuInstanceRequestAdapter wgpuAdapterRequestDevice wgpuAdapterGetInfo
-    wgpuDeviceGetQueue wgpuDevicePushErrorScope wgpuDevicePopErrorScope
+    wgpuAdapterGetLimits
+    wgpuDeviceGetQueue wgpuDeviceGetLimits wgpuDevicePushErrorScope wgpuDevicePopErrorScope
     wgpuDeviceCreateShaderModule wgpuDeviceCreateComputePipeline
     wgpuComputePipelineGetBindGroupLayout wgpuDeviceCreateBindGroupLayout
     wgpuDeviceCreateBindGroup wgpuDeviceCreatePipelineLayout

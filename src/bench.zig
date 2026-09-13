@@ -66,6 +66,13 @@ pub fn lastPickReport() ?PickReport {
     return last_report;
 }
 
+fn gpuRequestCanRun(size: usize, gpu_probe: gpu_context.ProbeResult) bool {
+    if (size > std.math.maxInt(usize) / @sizeOf(f32)) return false;
+    const groups = size / 64 +
+        (if (size % 64 == 0) @as(usize, 0) else @as(usize, 1));
+    return gpu_probe.canRun(size * @sizeOf(f32), groups);
+}
+
 /// Run the same selection algorithm with an explicit probe result.  Production
 /// calls use `GpuContext.probe()`; the parameter also makes the no-GPU path
 /// deterministic and testable without manufacturing a fake WebGPU device.
@@ -110,7 +117,7 @@ pub fn benchmarkWithProbe(
     var gpu_ns: ?u64 = null;
     var gpu_failure_reason: ?[]const u8 = null;
     if (comptime T == f32) {
-        if (gpu_probe.available) {
+        if (gpu_probe.available and gpuRequestCanRun(size, gpu_probe)) {
             gpu_ns = timeGpuAdd(out, a, b, iters) catch |err| blk: {
                 gpu_failure_reason = gpu_pipeline.lastFallbackReason() orelse @errorName(err);
                 break :blk null;
@@ -121,8 +128,10 @@ pub fn benchmarkWithProbe(
                     selected = .gpu_webgpu;
                 }
             }
-        } else {
+        } else if (!gpu_probe.available) {
             gpu_failure_reason = gpu_probe.reason;
+        } else {
+            gpu_failure_reason = gpu_context.ProbeFailure.request_exceeds_limits.reason();
         }
     } else {
         gpu_failure_reason = gpu_context.ProbeFailure.unsupported_type.reason();
@@ -162,6 +171,31 @@ test "pickBest excludes an unavailable GPU probe" {
     try std.testing.expect(!report.gpu_probe.available);
     try std.testing.expectEqualStrings(
         "WebGPU adapter request failed or returned no adapter",
+        report.gpu_failure_reason.?,
+    );
+}
+
+test "pickBest excludes an available probe that cannot run the request" {
+    const report = try benchmarkWithProbe(
+        std.testing.allocator,
+        f32,
+        128,
+        1,
+        .{
+            .available = true,
+            .failure = .none,
+            .reason = gpu_context.ProbeFailure.none.reason(),
+            .limits = .{
+                .maxComputeWorkgroupsPerDimension = 65_535,
+                .maxStorageBufferBindingSize = 511,
+                .maxBufferSize = 1 << 20,
+            },
+        },
+    );
+    try std.testing.expect(report.selected != .gpu_webgpu);
+    try std.testing.expect(report.gpu_ns == null);
+    try std.testing.expectEqualStrings(
+        "requested GPU size exceeds WebGPU limits",
         report.gpu_failure_reason.?,
     );
 }

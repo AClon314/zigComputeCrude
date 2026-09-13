@@ -39,7 +39,16 @@ pub const gpu_threshold: usize = 1 << 22;
 /// 启发式中的 CPU 闸门：逐元素内核在 N 足够大时 SIMD 更有优势。
 pub const simd_threshold: usize = 1024;
 
-/// 供启发式和测试共享的纯选择函数。GPU 只有在调用方已确认可用时才会入选。
+fn gpuRequestCanRun(size: usize, probe: gpu_context.ProbeResult) bool {
+    if (size > std.math.maxInt(usize) / @sizeOf(f32)) return false;
+    const groups = size / 64 +
+        (if (size % 64 == 0) @as(usize, 0) else @as(usize, 1));
+    return probe.canRun(size * @sizeOf(f32), groups);
+}
+
+/// 供旧调用方和纯阈值单元测试共享的选择函数。生产 heuristic 不使用
+/// 这个只有 bool 的兼容入口，而是必须经过 `heuristicWithGpuProbe` 的
+/// probe + limits 双重闸门。
 pub fn heuristicWithGpuAvailability(size: usize, gpu_available: bool) BackendType {
     if (size < gpu_threshold) {
         return if (size >= simd_threshold) .cpu_simd else .cpu_scalar;
@@ -47,11 +56,17 @@ pub fn heuristicWithGpuAvailability(size: usize, gpu_available: bool) BackendTyp
     return if (gpu_available) .gpu_webgpu else .cpu_simd;
 }
 
+/// 启发式的实际选择入口：GPU 必须既通过能力探测，又能在设备 limits
+/// 下容纳请求的 f32 buffer 和 2D workgroup grid。
+pub fn heuristicWithGpuProbe(size: usize, probe: gpu_context.ProbeResult) BackendType {
+    if (size < gpu_threshold) return heuristicWithGpuAvailability(size, false);
+    return if (gpuRequestCanRun(size, probe)) .gpu_webgpu else .cpu_simd;
+}
+
 /// 按规模选择后端；到 GPU 闸门前不会触发运行时初始化。
 pub fn heuristic(size: usize) BackendType {
     if (size < gpu_threshold) return heuristicWithGpuAvailability(size, false);
-    const probe = gpu_context.GpuContext.probe();
-    return heuristicWithGpuAvailability(size, probe.available);
+    return heuristicWithGpuProbe(size, gpu_context.GpuContext.probe());
 }
 
 test "backend enum basics" {
@@ -75,5 +90,29 @@ test "heuristic keeps GPU behind the measured-size gate" {
     try std.testing.expectEqual(
         BackendType.cpu_simd,
         heuristicWithGpuAvailability(gpu_threshold, false),
+    );
+}
+
+test "heuristic requires a runnable GPU limits probe" {
+    const probe = gpu_context.ProbeResult{
+        .available = true,
+        .failure = .none,
+        .reason = gpu_context.ProbeFailure.none.reason(),
+        .limits = .{
+            .maxComputeWorkgroupsPerDimension = 65_535,
+            .maxStorageBufferBindingSize = 1 << 30,
+            .maxBufferSize = 1 << 30,
+        },
+    };
+    try std.testing.expectEqual(
+        BackendType.gpu_webgpu,
+        heuristicWithGpuProbe(1 << 22, probe),
+    );
+
+    var too_small = probe;
+    too_small.limits.maxBufferSize = (1 << 22) * @sizeOf(f32) - 1;
+    try std.testing.expectEqual(
+        BackendType.cpu_simd,
+        heuristicWithGpuProbe(1 << 22, too_small),
     );
 }

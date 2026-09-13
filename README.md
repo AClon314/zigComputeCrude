@@ -103,7 +103,7 @@ src/bindings/web/shell.html    # 平台闸门 + rAF pump + 结果展示
 
 ```text
 queueWriteBuffer(host -> storage)
-  -> compute pass (workgroup_size(64))
+  -> compute pass (2D dispatch, workgroup_size(64))
   -> queueSubmit
   -> copy output -> MapRead staging
   -> bufferMapAsync + wgpuInstanceProcessEvents pump
@@ -114,6 +114,24 @@ pipeline、pipeline layout、bind group layout，以及当前 kernel/大小对�
 params、staging buffer 和 bind group 都缓存在 `GpuContext` 中，不会在每次 `add`
 调用时重建 shader pipeline。越界 invocation 由 WGSL 中的 `arrayLength` 检查挡住。
 当前 GPU API 对外支持 `f32`；其它 `T` 会走正确的 CPU SIMD fallback。
+
+### 限制与已知边界
+
+WebGPU 的 `maxComputeWorkgroupsPerDimension` 是**每个 dispatch 轴**的上限，不能把
+它误读成整个计算只能有 65,535 个 workgroup。本项目把线性的 workgroup 流铺成
+`x = min(limit, groups)`、`y = ceil(groups / x)` 的 2D grid；`add.wgsl` 与
+`saxpy.wgsl` 用 `num_workgroups.x` 和 `global_invocation_id.y` 还原线性下标，越界
+保护仍由原来的 `arrayLength` 判断负责。因此 `groups = 65,536` 及更大的常见输入
+不会再因为 1D dispatch 上限而回退；只要 2D grid 两轴和 buffer 大小仍在设备能力内，
+GPU 路径会正常执行。
+
+初始化时从 `wgpuAdapterGetLimits` 和 `wgpuDeviceGetLimits` 读取 limits，并把设备
+实际使用的 `maxComputeWorkgroupsPerDimension`、`maxStorageBufferBindingSize`、
+`maxBufferSize` 缓存在 `GpuContext` / `ProbeResult`。`GpuContext.canRun()` 同时检查
+这三个边界（输入、输出和 staging buffer 都必须能创建）；超过边界的请求会在提交
+前返回 GPU 错误，`heuristic` 与 `--auto` 不会把它当成可运行候选。浏览器端复用同一
+份 2D 感知 WGSL；当前 demo 固定为 `1<<20`，并且 dispatch 也走同样的 2D 形式。
+
 
 ### ABI / 踩坑记录
 
@@ -132,7 +150,7 @@ params、staging buffer 和 bind group 都缓存在 `GpuContext` 中，不会在
 
 ```bash
 tools/check_abi_drift.sh
-# OK: 28 compute symbols identical
+# OK: 30 compute symbols identical
 ```
 
 ## 浏览器 WebGPU（wasm）
@@ -179,7 +197,8 @@ GPU add: MATCH (n=1048576, gpu=31.000 ms, cpu_simd=0.800 ms)
   `gpu_webgpu (fell back: <reason>)`。
 - `heuristic`：小于 `gpu_threshold = 1<<22` 时只在 CPU scalar/SIMD 中选择（`size >=
   1024` 为 `cpu_simd`）。达到 GPU 闸门后，先调用一次缓存的
-  `GpuContext.probe()`；只有探测成功才返回 `gpu_webgpu`，否则返回 `cpu_simd`。
+  `GpuContext.probe()`，并同时检查 f32 字节数、2D workgroup grid 和设备 limits；
+  只有探测成功且 `canRun()` 为真才返回 `gpu_webgpu`，否则返回 `cpu_simd`。
   这个阈值是根据本机 T1 实测确定的保守闸门：`size=1<<20` 时 GPU 端到端
   4.652 GB/s、CPU SIMD 14.676 GB/s，不能把“有 GPU”当成“GPU 更快”。
 - `benchmark`：`--auto` 先做能力探测，然后只把探测成功的 GPU 纳入**端到端**
@@ -192,10 +211,13 @@ GPU add: MATCH (n=1048576, gpu=31.000 ms, cpu_simd=0.800 ms)
 ## 能力探测与回退语义
 
 `GpuContext.probe()` 在 native 进程内用线程安全的一次性缓存建立 instance、adapter、
-device 和 queue。成功与失败都缓存；失败的 `ProbeResult` 同时提供 `failure` 枚举和
-稳定的 `reason` 文本，例如 instance 创建失败、adapter/device 请求失败或初始化回调
-超时。成功探测得到的 context 会直接供后续 GPU 调用复用，不会“探测一次、执行时再
-悄悄建另一个 context”。`resetGlobal()` 仅供测试或明确要重试驱动环境的应用使用。
+device 和 queue，并读取 adapter/device limits。成功与失败都缓存；失败的 `ProbeResult`
+同时提供 `failure` 枚举和稳定的 `reason` 文本，例如 instance 创建失败、limits 查询
+失败、adapter/device 请求失败或初始化回调超时。成功结果还带有实际设备的
+`maxComputeWorkgroupsPerDimension`、`maxStorageBufferBindingSize`、`maxBufferSize`，
+可用 `ProbeResult.canRun()` 预判某个请求。成功探测得到的 context 会直接供后续 GPU
+调用复用，不会“探测一次、执行时再悄悄建另一个 context”。`resetGlobal()` 仅供测试或
+明确要重试驱动环境的应用使用。
 
 低层 `computeAccel.gpu.add` / `saxpy` 保留 `!void` 错误，让调用方能区分 GPU 失败；
 `ComputeEngine(.gpu_webgpu)` 为兼容原有的 `void` API 仍会回退 `cpu_simd`，但会记录

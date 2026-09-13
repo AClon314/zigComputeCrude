@@ -14,6 +14,7 @@ pub const ComputeEngine = engine.ComputeEngine;
 pub const bench = bench_mod;
 pub const gpu = gpu_pipeline;
 pub const GpuContext = gpu_context.GpuContext;
+pub const GpuLimits = gpu_context.GpuLimits;
 pub const ProbeFailure = gpu_context.ProbeFailure;
 pub const ProbeResult = gpu_context.ProbeResult;
 
@@ -114,6 +115,42 @@ test "gpu webgpu add matches CPU backends" {
     ComputeEngine(.cpu_scalar).add(f32, out_scalar, a, b);
     ComputeEngine(.cpu_simd).add(f32, out_simd, a, b);
     try gpu_pipeline.addWithContext(&context, out_gpu, a, b);
+    try std.testing.expectEqualSlices(f32, out_scalar, out_simd);
+    try std.testing.expectEqualSlices(f32, out_scalar, out_gpu);
+}
+
+test "gpu webgpu add uses 2D dispatch past 65535 workgroups" {
+    const n: usize = 1 << 22;
+    const groups = (n + 63) / 64;
+    try std.testing.expectEqual(@as(usize, 65_536), groups);
+
+    const gpa = std.testing.allocator;
+    var context = gpu_context.GpuContext.init(gpa) catch |err| switch (err) {
+        error.GpuError => return error.SkipZigTest,
+    };
+    defer context.deinit();
+
+    try std.testing.expect(context.canRun(n * @sizeOf(f32), groups));
+
+    const a = try gpa.alloc(f32, n);
+    defer gpa.free(a);
+    const b = try gpa.alloc(f32, n);
+    defer gpa.free(b);
+    const out_gpu = try gpa.alloc(f32, n);
+    defer gpa.free(out_gpu);
+    const out_scalar = try gpa.alloc(f32, n);
+    defer gpa.free(out_scalar);
+    const out_simd = try gpa.alloc(f32, n);
+    defer gpa.free(out_simd);
+
+    @memset(a, 2.0);
+    @memset(b, 3.0);
+    ComputeEngine(.cpu_scalar).add(f32, out_scalar, a, b);
+    ComputeEngine(.cpu_simd).add(f32, out_simd, a, b);
+
+    gpu_pipeline.clearFallbackReason();
+    try gpu_pipeline.addWithContext(&context, out_gpu, a, b);
+    try std.testing.expect(gpu_pipeline.lastFallbackReason() == null);
     try std.testing.expectEqualSlices(f32, out_scalar, out_simd);
     try std.testing.expectEqualSlices(f32, out_scalar, out_gpu);
 }

@@ -224,10 +224,16 @@ const Runner = struct {
         };
         wgpu.wgpuComputePassEncoderSetPipeline(pass, self.pipeline);
         wgpu.wgpuComputePassEncoderSetBindGroup(pass, 0, self.bind_group, 0, null);
+        // Keep the browser entry on the same 2D-grid path as native.  The
+        // fixed demo size is below the guaranteed per-dimension limit, but
+        // using the flattened form verifies the shared WGSL contract.
+        const workgroups: usize = (element_count + 63) / 64;
+        const dispatch_x: usize = @min(workgroups, 65_535);
+        const dispatch_y: usize = (workgroups - 1) / dispatch_x + 1;
         wgpu.wgpuComputePassEncoderDispatchWorkgroups(
             pass,
-            @intCast((element_count + 63) / 64),
-            1,
+            @intCast(dispatch_x),
+            @intCast(dispatch_y),
             1,
         );
         wgpu.wgpuComputePassEncoderEnd(pass);

@@ -8,6 +8,35 @@ const saxpy_shader = @embedFile("shaders/saxpy.wgsl");
 
 const Kernel = enum { add, saxpy };
 
+const WorkgroupGrid = struct {
+    x: u32,
+    y: u32,
+};
+
+fn workgroupCount(n: usize) usize {
+    return (n + 63) / 64;
+}
+
+/// WebGPU limits each dispatch axis independently.  Flattening the linear
+/// workgroup stream into a 2D grid keeps both axes within the device limit and
+/// lets the WGSL kernel recover the same linear element index from
+/// `num_workgroups`; unlike repeated dispatches, this needs no offset uniform.
+fn dispatchGrid(self: *const GpuContext, groups: usize) !WorkgroupGrid {
+    if (groups == 0) return error.GpuError;
+    const max_dimension: u64 = self.limits.maxComputeWorkgroupsPerDimension;
+    if (max_dimension == 0) return error.GpuError;
+
+    const group_count: u64 = @intCast(groups);
+    const x = @min(group_count, max_dimension);
+    const y = (group_count - 1) / x + 1;
+    if (y > max_dimension) return error.GpuError;
+
+    return .{
+        .x = @intCast(x),
+        .y = @intCast(y),
+    };
+}
+
 fn kernelIndex(kernel: Kernel) usize {
     return switch (kernel) {
         .add => 0,
@@ -184,9 +213,11 @@ fn dispatchMany(
 ) !void {
     const index = kernelIndex(kernel);
     const resources = &self.resources[index];
-    const workgroup_count = (n + 63) / 64;
-    if (workgroup_count > std.math.maxInt(u32)) return error.GpuError;
-    if (repetitions == 0) return error.GpuError;
+    const workgroup_count = workgroupCount(n);
+    if (repetitions == 0 or !self.canRun(byte_size, workgroup_count)) {
+        return error.GpuError;
+    }
+    const grid = try dispatchGrid(self, workgroup_count);
 
     self.beginErrorScope();
     const encoder = wgpu.wgpuDeviceCreateCommandEncoder(self.device, null) orelse {
@@ -204,8 +235,8 @@ fn dispatchMany(
         wgpu.wgpuComputePassEncoderSetBindGroup(pass, 0, resources.bind_group, 0, null);
         wgpu.wgpuComputePassEncoderDispatchWorkgroups(
             pass,
-            @intCast(workgroup_count),
-            1,
+            grid.x,
+            grid.y,
             1,
         );
         wgpu.wgpuComputePassEncoderEnd(pass);
@@ -263,11 +294,8 @@ fn execute(
     if (out.len != a.len or a.len != b.len) return error.GpuError;
     if (out.len == 0) return;
     if (out.len > std.math.maxInt(usize) / @sizeOf(f32)) return error.GpuError;
-    // WebGPU guarantees at least 65535 workgroups in one dimension.  This
-    // backend uses a one-dimensional dispatch; reject larger inputs before
-    // submitting an invalid command instead of relying on a driver error.
-    if ((out.len + 63) / 64 > 65_535) return error.GpuError;
     const byte_size = out.len * @sizeOf(f32);
+    if (!self.canRun(byte_size, workgroupCount(out.len))) return error.GpuError;
 
     try ensurePipeline(self, kernel);
     try ensureResources(self, kernel, byte_size);
@@ -306,8 +334,8 @@ pub fn addBatchedWithContext(
     if (out.len != a.len or a.len != b.len) return error.GpuError;
     if (out.len == 0 or iters == 0) return error.GpuError;
     if (out.len > std.math.maxInt(usize) / @sizeOf(f32)) return error.GpuError;
-    if ((out.len + 63) / 64 > 65_535) return error.GpuError;
     const byte_size = out.len * @sizeOf(f32);
+    if (!self.canRun(byte_size, workgroupCount(out.len))) return error.GpuError;
 
     try ensurePipeline(self, .add);
     try ensureResources(self, .add, byte_size);

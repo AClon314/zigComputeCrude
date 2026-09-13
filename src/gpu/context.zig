@@ -5,6 +5,34 @@ const wgpu = @import("webgpu.zig");
 /// the public engine API can then fall back to a CPU implementation.
 pub const GpuError = error{GpuError};
 
+/// The subset of device limits needed by the compute backend.  A dispatch is
+/// laid out as a 2D grid, so both axes must fit
+/// `maxComputeWorkgroupsPerDimension`; each storage/staging allocation must fit
+/// both buffer-size limits.
+pub const GpuLimits = struct {
+    maxComputeWorkgroupsPerDimension: u32 = 0,
+    maxStorageBufferBindingSize: u64 = 0,
+    maxBufferSize: u64 = 0,
+
+    pub fn canRun(self: GpuLimits, n_bytes: usize, groups: usize) bool {
+        if (n_bytes == 0 or groups == 0) return false;
+        const byte_count: u64 = @intCast(n_bytes);
+        if (byte_count > self.maxStorageBufferBindingSize or
+            byte_count > self.maxBufferSize)
+        {
+            return false;
+        }
+
+        const max_dimension: u64 = self.maxComputeWorkgroupsPerDimension;
+        if (max_dimension == 0) return false;
+        const group_count: u64 = @intCast(groups);
+        const x = @min(group_count, max_dimension);
+        // x is non-zero because groups and max_dimension were checked above.
+        const y = (group_count - 1) / x + 1;
+        return y <= max_dimension;
+    }
+};
+
 /// Why the one-time capability probe failed.  The enum is intentionally more
 /// useful to callers than a bare bool, while the accompanying `reason` string
 /// remains stable and allocation-free for CLI diagnostics.
@@ -14,10 +42,13 @@ pub const ProbeFailure = enum {
     instance_unavailable,
     adapter_unavailable,
     adapter_info_unavailable,
+    adapter_limits_unavailable,
     device_unavailable,
+    device_limits_unavailable,
     queue_unavailable,
     initialization_timeout,
     unsupported_type,
+    request_exceeds_limits,
 
     pub fn reason(self: ProbeFailure) []const u8 {
         return switch (self) {
@@ -26,10 +57,13 @@ pub const ProbeFailure = enum {
             .instance_unavailable => "wgpuCreateInstance returned null (no WebGPU instance)",
             .adapter_unavailable => "WebGPU adapter request failed or returned no adapter",
             .adapter_info_unavailable => "wgpuAdapterGetInfo failed",
+            .adapter_limits_unavailable => "wgpuAdapterGetLimits failed",
             .device_unavailable => "WebGPU device request failed or returned no device",
+            .device_limits_unavailable => "wgpuDeviceGetLimits failed",
             .queue_unavailable => "wgpuDeviceGetQueue returned null",
             .initialization_timeout => "WebGPU initialization callback timed out",
             .unsupported_type => "gpu_webgpu is only available for f32 operations",
+            .request_exceeds_limits => "requested GPU size exceeds WebGPU limits",
         };
     }
 };
@@ -38,11 +72,16 @@ pub const ProbeResult = struct {
     available: bool,
     failure: ProbeFailure,
     reason: []const u8,
+    limits: GpuLimits = .{},
     adapter_backend_type: wgpu.WGPUBackendType = wgpu.WGPUBackendType_Undefined,
     adapter_vendor_id: u32 = 0,
 
     pub fn isAvailable(self: ProbeResult) bool {
         return self.available;
+    }
+
+    pub fn canRun(self: ProbeResult, n_bytes: usize, groups: usize) bool {
+        return self.available and self.limits.canRun(n_bytes, groups);
     }
 
     pub fn unavailable(failure: ProbeFailure) ProbeResult {
@@ -58,7 +97,9 @@ const InitFailure = error{
     InstanceUnavailable,
     AdapterUnavailable,
     AdapterInfoUnavailable,
+    AdapterLimitsUnavailable,
     DeviceUnavailable,
+    DeviceLimitsUnavailable,
     QueueUnavailable,
     InitializationTimeout,
 };
@@ -180,6 +221,7 @@ pub const GpuContext = struct {
     adapter: wgpu.WGPUAdapter = null,
     device: wgpu.WGPUDevice = null,
     queue: wgpu.WGPUQueue = null,
+    limits: GpuLimits = .{},
     adapter_backend_type: wgpu.WGPUBackendType = wgpu.WGPUBackendType_Undefined,
     adapter_vendor_id: u32 = 0,
 
@@ -239,6 +281,17 @@ pub const GpuContext = struct {
         self.adapter_backend_type = info.backendType;
         self.adapter_vendor_id = info.vendorID;
 
+        // Query the adapter before requesting a device and query the device
+        // again below.  The device limits are authoritative for the context;
+        // keeping both calls here also catches an ABI/driver failure before a
+        // size-dependent dispatch reaches validation.
+        var adapter_limits = std.mem.zeroes(wgpu.WGPULimits);
+        if (wgpu.wgpuAdapterGetLimits(self.adapter, &adapter_limits) !=
+            wgpu.WGPUStatus_Success)
+        {
+            return error.AdapterLimitsUnavailable;
+        }
+
         var device_state = DeviceRequestState{};
         _ = wgpu.wgpuAdapterRequestDevice(self.adapter, null, .{
             .nextInChain = null,
@@ -254,6 +307,19 @@ pub const GpuContext = struct {
             return error.DeviceUnavailable;
         }
         self.device = device_state.device;
+
+        var device_limits = std.mem.zeroes(wgpu.WGPULimits);
+        if (wgpu.wgpuDeviceGetLimits(self.device, &device_limits) !=
+            wgpu.WGPUStatus_Success)
+        {
+            return error.DeviceLimitsUnavailable;
+        }
+        self.limits = .{
+            .maxComputeWorkgroupsPerDimension = device_limits.maxComputeWorkgroupsPerDimension,
+            .maxStorageBufferBindingSize = device_limits.maxStorageBufferBindingSize,
+            .maxBufferSize = device_limits.maxBufferSize,
+        };
+
         self.queue = wgpu.wgpuDeviceGetQueue(self.device) orelse
             return error.QueueUnavailable;
 
@@ -265,6 +331,13 @@ pub const GpuContext = struct {
     /// cache itself lives at module scope.
     pub fn probe() ProbeResult {
         return probeCached();
+    }
+
+    /// Return whether this context can represent both the requested buffers
+    /// and the flattened 2D dispatch grid without submitting a validation
+    /// error.
+    pub fn canRun(self: *const GpuContext, n_bytes: usize, groups: usize) bool {
+        return self.limits.canRun(n_bytes, groups);
     }
 
     pub fn deinit(self: *GpuContext) void {
@@ -437,7 +510,9 @@ fn failureForInitError(err: InitFailure) ProbeFailure {
         error.InstanceUnavailable => .instance_unavailable,
         error.AdapterUnavailable => .adapter_unavailable,
         error.AdapterInfoUnavailable => .adapter_info_unavailable,
+        error.AdapterLimitsUnavailable => .adapter_limits_unavailable,
         error.DeviceUnavailable => .device_unavailable,
+        error.DeviceLimitsUnavailable => .device_limits_unavailable,
         error.QueueUnavailable => .queue_unavailable,
         error.InitializationTimeout => .initialization_timeout,
     };
@@ -462,6 +537,7 @@ fn probeLocked() ProbeResult {
         .available = true,
         .failure = .none,
         .reason = ProbeFailure.none.reason(),
+        .limits = context.limits,
         .adapter_backend_type = context.adapter_backend_type,
         .adapter_vendor_id = context.adapter_vendor_id,
     };
@@ -549,4 +625,27 @@ pub fn lastFallbackReason() ?[]const u8 {
     lock(&fallback_mutex);
     defer fallback_mutex.unlock();
     return fallback_reason;
+}
+
+test "GPU limits bound buffers and the 2D dispatch grid" {
+    const limits = GpuLimits{
+        .maxComputeWorkgroupsPerDimension = 2,
+        .maxStorageBufferBindingSize = 4096,
+        .maxBufferSize = 8192,
+    };
+
+    try std.testing.expect(limits.canRun(4096, 4));
+    try std.testing.expect(!limits.canRun(4097, 4));
+    try std.testing.expect(!limits.canRun(4096, 5));
+    try std.testing.expect(!limits.canRun(8193, 4));
+    try std.testing.expect(!limits.canRun(0, 0));
+
+    const available_probe = ProbeResult{
+        .available = true,
+        .failure = .none,
+        .reason = ProbeFailure.none.reason(),
+        .limits = limits,
+    };
+    try std.testing.expect(available_probe.canRun(4096, 4));
+    try std.testing.expect(!ProbeResult.unavailable(.none).canRun(4096, 4));
 }
