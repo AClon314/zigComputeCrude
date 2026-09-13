@@ -78,9 +78,9 @@ src/chain_bench.zig   # M0 消融基准（saxpy 链、GEMM→bias→reduce 链�
 v2 目标布局（迁移路径见 `docs/node-system-migration.md` §6）：`runtime/`、
 `backends/{cpu,webgpu}/`、`primitives/`、`determinism.zig`、`capability.zig`。
 迁移规则：**旧的按 kernel 划分的 shape-keyed cache 逐步并入 runtime.Buffer**，
-新内核一律走 `runtime.Kernel` + `Chain`。add/saxpy 已迁移（见
-`primitives/elementwise.zig`；`gpu/pipeline.zig` 是兼容 shim）、gemm 已迁移
-（`gpu/gemm.zig` 的 `Kernels` 可在任意 Chain 里绑定调用），reduce 待迁。
+新内核一律走 `runtime.Kernel` + `Chain`。**全部内置 kernel 已迁移**：add/saxpy（`primitives/elementwise.zig`；
+`gpu/pipeline.zig` 是兼容 shim）、gemm（`Kernels` + `VariantCache`）、
+reduce（`Kernels` + `bindAll`/`Binding`）；旧的内建 cache 已从 `GpuContext` 删除。
 
 依赖方向（无环）：`root` → 各模块；`runtime` → `gpu/context` + `gpu/webgpu`；
 `chain_bench` → `runtime` + 参考实现；`gpu/*` 不反向依赖 `runtime`。

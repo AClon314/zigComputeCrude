@@ -22,8 +22,6 @@ const gemm_mod = @import("gpu/gemm.zig");
 const reduce_mod = @import("gpu/reduce.zig");
 
 const saxpy_shader = @embedFile("gpu/shaders/saxpy.wgsl");
-const gemm_shader = @embedFile("gpu/shaders/gemm_tiled.wgsl");
-const reduce_shader = @embedFile("gpu/shaders/reduce.wgsl");
 const bias_add_shader = @embedFile("gpu/shaders/bias_add.wgsl");
 
 pub const Mode = enum {
@@ -252,13 +250,8 @@ pub fn runGemmBiasReduceChain(
     const buckets = reduce_mod.bucketCount(ctx.limits, c_elements);
     if (buckets == 0) return error.GpuError;
 
-    var gemm_kernel = try runtime.Kernel.init(ctx, gemm_shader, "main", &.{
-        .{ .kind = .storage, .access = .read },
-        .{ .kind = .storage, .access = .read },
-        .{ .kind = .storage, .access = .write },
-        .{ .kind = .uniform, .access = .read },
-    }, 64);
-    defer gemm_kernel.deinit();
+    var gemm_kernels = try gemm_mod.Kernels.init(ctx);
+    defer gemm_kernels.deinit();
     var bias_kernel = try runtime.Kernel.init(ctx, bias_add_shader, "main", &.{
         .{ .kind = .storage, .access = .read },
         .{ .kind = .storage, .access = .read },
@@ -266,12 +259,8 @@ pub fn runGemmBiasReduceChain(
         .{ .kind = .uniform, .access = .read },
     }, 64);
     defer bias_kernel.deinit();
-    var reduce_kernel = try runtime.Kernel.init(ctx, reduce_shader, "sum_main", &.{
-        .{ .kind = .storage, .access = .read },
-        .{ .kind = .storage, .access = .write },
-        .{ .kind = .uniform, .access = .read },
-    }, 64);
-    defer reduce_kernel.deinit();
+    var reduce_kernels = try reduce_mod.Kernels.init(ctx);
+    defer reduce_kernels.deinit();
 
     var a_buf = try runtime.Buffer.init(ctx, m * k * @sizeOf(f32), storage_r);
     defer a_buf.deinit(ctx);
@@ -314,20 +303,21 @@ pub fn runGemmBiasReduceChain(
     try b_buf.toDevice(ctx, std.mem.sliceAsBytes(b));
     try bias_buf.toDevice(ctx, std.mem.sliceAsBytes(bias));
 
-    const gemm_bind = try gemm_kernel.createBindGroup(&.{ &a_buf, &b_buf, &c_buf, &gemm_params_buf });
+    const gemm_bind = try gemm_kernels.bind(.tiled, &a_buf, &b_buf, &c_buf, &gemm_params_buf);
     defer runtime.releaseBindGroup(gemm_bind);
     const bias_bind = try bias_kernel.createBindGroup(&.{ &c_buf, &bias_buf, &d_buf, &bias_params_buf });
     defer runtime.releaseBindGroup(bias_bind);
-    const reduce_bind_c = try reduce_kernel.createBindGroup(&.{ &d_buf, &partials, &reduce_params_c });
-    defer runtime.releaseBindGroup(reduce_bind_c);
-    const reduce_bind_p = try reduce_kernel.createBindGroup(&.{ &partials, &final, &reduce_params_p });
-    defer runtime.releaseBindGroup(reduce_bind_p);
+    var reduce_binding = try reduce_mod.bindAll(
+        &reduce_kernels,
+        &d_buf,
+        &partials,
+        &final,
+        &reduce_params_c,
+        &reduce_params_p,
+    );
+    defer reduce_mod.releaseBinding(&reduce_binding);
 
-    const tile = 16;
-    const gemm_grid = context_mod.WorkgroupGrid{
-        .x = @intCast((n + tile - 1) / tile),
-        .y = @intCast((m + tile - 1) / tile),
-    };
+    const gemm_grid = try gemm_mod.gridFor(ctx.limits, m, k, n, .tiled);
     const bias_grid = try bias_kernel.gridLinear(c_elements);
     const reduce_grid1 = context_mod.WorkgroupGrid{ .x = @intCast(buckets), .y = 1 };
     const reduce_grid2 = context_mod.WorkgroupGrid{ .x = 1, .y = 1 };
@@ -345,7 +335,7 @@ pub fn runGemmBiasReduceChain(
                 {
                     var chain = try runtime.Chain.begin(ctx);
                     errdefer chain.deinit();
-                    try chain.dispatch(&gemm_kernel, gemm_bind, &.{ &a_buf, &b_buf, &c_buf, &gemm_params_buf }, gemm_grid);
+                    try chain.dispatch(gemm_kernels.kernel(.tiled), gemm_bind, &.{ &a_buf, &b_buf, &c_buf, &gemm_params_buf }, gemm_grid);
                     try chain.download(&c_buf, std.mem.sliceAsBytes(host_c));
                     try chain.submit();
                 }
@@ -362,8 +352,8 @@ pub fn runGemmBiasReduceChain(
                 try d_buf.toDevice(ctx, std.mem.sliceAsBytes(host_d));
                 var chain = try runtime.Chain.begin(ctx);
                 errdefer chain.deinit();
-                try chain.dispatch(&reduce_kernel, reduce_bind_c, &.{ &d_buf, &partials, &reduce_params_c }, reduce_grid1);
-                try chain.dispatch(&reduce_kernel, reduce_bind_p, &.{ &partials, &final, &reduce_params_p }, reduce_grid2);
+                try chain.dispatch(reduce_kernels.kernel(.sum), reduce_binding.first[0].?, &.{ &d_buf, &partials, &reduce_params_c }, reduce_grid1);
+                try chain.dispatch(reduce_kernels.kernel(.sum), reduce_binding.second[0].?, &.{ &partials, &final, &reduce_params_p }, reduce_grid2);
                 try chain.download(&final, std.mem.asBytes(out_sum));
                 try chain.submit();
             }
@@ -372,10 +362,10 @@ pub fn runGemmBiasReduceChain(
             for (0..repetitions) |_| {
                 var chain = try runtime.Chain.begin(ctx);
                 errdefer chain.deinit();
-                try chain.dispatch(&gemm_kernel, gemm_bind, &.{ &a_buf, &b_buf, &c_buf, &gemm_params_buf }, gemm_grid);
+                try chain.dispatch(gemm_kernels.kernel(.tiled), gemm_bind, &.{ &a_buf, &b_buf, &c_buf, &gemm_params_buf }, gemm_grid);
                 try chain.dispatch(&bias_kernel, bias_bind, &.{ &c_buf, &bias_buf, &d_buf, &bias_params_buf }, bias_grid);
-                try chain.dispatch(&reduce_kernel, reduce_bind_c, &.{ &d_buf, &partials, &reduce_params_c }, reduce_grid1);
-                try chain.dispatch(&reduce_kernel, reduce_bind_p, &.{ &partials, &final, &reduce_params_p }, reduce_grid2);
+                try chain.dispatch(reduce_kernels.kernel(.sum), reduce_binding.first[0].?, &.{ &d_buf, &partials, &reduce_params_c }, reduce_grid1);
+                try chain.dispatch(reduce_kernels.kernel(.sum), reduce_binding.second[0].?, &.{ &partials, &final, &reduce_params_p }, reduce_grid2);
                 try chain.download(&final, std.mem.asBytes(out_sum));
                 try chain.submit();
             }

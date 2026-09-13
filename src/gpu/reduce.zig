@@ -1,4 +1,5 @@
-//! Two-pass workgroup reduction (sum / max) — Step 3 of the GPU roadmap.
+//! Two-pass workgroup reduction (sum / max) — Step 3 of the GPU roadmap,
+//! migrated to the M0 runtime (M1).
 //!
 //! Pass 1 dispatches `buckets` workgroups; each reduces a grid-strided slice
 //! of the input into one partial value (`partials[workgroup_id]`).  Pass 2
@@ -6,12 +7,13 @@
 //! value.  Both passes run the same WGSL entry point (`sum_main` / `max_main`)
 //! through two bind groups, so no second shader is needed.
 //!
-//! The workgroup-level combine uses `var<workgroup>` shared memory with
-//! barrier-separated tree reduction — the same shared-memory pattern the tiled
-//! GEMM uses — which is why this kernel is part of the tiling roadmap.
+//! `Kernels` is the composable half: compiled sum/max pipelines plus a `bind`
+//! helper returning the two bind groups (input->partials, partials->final) for
+//! caller-owned runtime buffers.  The slice-based `reduce`/`reduceBatched`
+//! entry points keep the historical per-call behaviour.
 
 const std = @import("std");
-const wgpu = @import("webgpu.zig");
+const runtime = @import("../runtime.zig");
 const context_mod = @import("context.zig");
 const GpuContext = context_mod.GpuContext;
 
@@ -38,69 +40,11 @@ const Params = extern struct {
     pad2: u32,
 };
 
-const Cache = struct {
-    device: wgpu.WGPUDevice = null,
-    n: usize = 0,
-    buckets: usize = 0,
-
-    bind_group_layout: wgpu.WGPUBindGroupLayout = null,
-    // sum/max share the bind group layout above.
-    pipelines: [2]context_mod.PipelineCache = .{ .{}, .{} },
-
-    input: wgpu.WGPUBuffer = null,
-    partials: wgpu.WGPUBuffer = null,
-    final: wgpu.WGPUBuffer = null,
-    staging: wgpu.WGPUBuffer = null,
-    params_in: wgpu.WGPUBuffer = null,
-    params_partials: wgpu.WGPUBuffer = null,
-    bind_group_in: wgpu.WGPUBindGroup = null,
-    bind_group_partials: wgpu.WGPUBindGroup = null,
-
-    fn deinitBuffers(self: *Cache) void {
-        if (self.bind_group_in) |handle| wgpu.wgpuBindGroupRelease(handle);
-        self.bind_group_in = null;
-        if (self.bind_group_partials) |handle| wgpu.wgpuBindGroupRelease(handle);
-        self.bind_group_partials = null;
-        for ([_]*wgpu.WGPUBuffer{
-            &self.input,
-            &self.partials,
-            &self.final,
-            &self.staging,
-            &self.params_in,
-            &self.params_partials,
-        }) |slot| {
-            if (slot.*) |handle| wgpu.wgpuBufferRelease(handle);
-            slot.* = null;
-        }
-        self.n = 0;
-        self.buckets = 0;
-    }
-
-    fn deinit(self: *Cache) void {
-        self.deinitBuffers();
-        for (&self.pipelines) |*slot| slot.deinit();
-        if (self.bind_group_layout) |handle| wgpu.wgpuBindGroupLayoutRelease(handle);
-        self.bind_group_layout = null;
-        self.device = null;
-    }
+const kernel_bindings = [_]runtime.Binding{
+    .{ .kind = .storage, .access = .read }, // input
+    .{ .kind = .storage, .access = .write }, // output (partials or final)
+    .{ .kind = .uniform, .access = .read }, // params
 };
-
-var global_cache: Cache = .{};
-var cache_mutex: std.atomic.Mutex = .unlocked;
-
-fn lockCache() void {
-    while (!cache_mutex.tryLock()) std.atomic.spinLoopHint();
-}
-
-fn unlockCache() void {
-    cache_mutex.unlock();
-}
-
-pub fn resetCache() void {
-    lockCache();
-    defer unlockCache();
-    global_cache.deinit();
-}
 
 fn opIndex(op: Op) usize {
     return switch (op) {
@@ -109,8 +53,153 @@ fn opIndex(op: Op) usize {
     };
 }
 
-fn emptyStringView() wgpu.WGPUStringView {
-    return .{ .data = null, .length = wgpu.WGPU_STRLEN };
+/// Compiled pipelines for one device; buffer-agnostic and cheap to share.
+pub const Kernels = struct {
+    ctx: *runtime.Device,
+    sum: runtime.Kernel,
+    max: runtime.Kernel,
+
+    pub fn init(ctx: *runtime.Device) !Kernels {
+        var self = Kernels{
+            .ctx = ctx,
+            .sum = try runtime.Kernel.init(ctx, reduce_shader, "sum_main", &kernel_bindings, workgroup_size),
+            .max = undefined,
+        };
+        errdefer self.sum.deinit();
+        self.max = try runtime.Kernel.init(ctx, reduce_shader, "max_main", &kernel_bindings, workgroup_size);
+        return self;
+    }
+
+    pub fn deinit(self: *Kernels) void {
+        self.max.deinit();
+        self.sum.deinit();
+    }
+
+    pub fn kernel(self: *const Kernels, op: Op) *const runtime.Kernel {
+        return if (op == .sum) &self.sum else &self.max;
+    }
+
+    /// Both stages' bind groups for one op: `first` = (input, partials,
+    /// params_in), `second` = (partials, final, params_partials).  Created
+    /// per op so no group-equivalence assumptions are needed.
+    pub fn bindStage(
+        self: *const Kernels,
+        op: Op,
+        input: *const runtime.Buffer,
+        output: *const runtime.Buffer,
+        params: *const runtime.Buffer,
+    ) !?*anyopaque {
+        return self.kernel(op).createBindGroup(&.{ input, output, params });
+    }
+};
+
+/// All bind groups a full two-pass reduction needs.
+pub const Binding = struct {
+    first: [2]?*anyopaque, // input -> partials
+    second: [2]?*anyopaque, // partials -> final
+};
+
+/// Bind both stages for every op over the same buffers.
+pub fn bindAll(
+    kernels: *const Kernels,
+    input: *const runtime.Buffer,
+    partials: *const runtime.Buffer,
+    final: *const runtime.Buffer,
+    params_in: *const runtime.Buffer,
+    params_partials: *const runtime.Buffer,
+) !Binding {
+    var binding = Binding{
+        .first = .{ null, null },
+        .second = .{ null, null },
+    };
+    for ([_]Op{ .sum, .max }) |op| {
+        const index = opIndex(op);
+        binding.first[index] = try kernels.bindStage(op, input, partials, params_in);
+        binding.second[index] = try kernels.bindStage(op, partials, final, params_partials);
+    }
+    return binding;
+}
+
+/// Release a `Binding` produced by `bindAll`.
+pub fn releaseBinding(binding: *Binding) void {
+    for (&binding.first) |*handle| {
+        if (handle.*) |value| runtime.releaseBindGroup(value);
+        handle.* = null;
+    }
+    for (&binding.second) |*handle| {
+        if (handle.*) |value| runtime.releaseBindGroup(value);
+        handle.* = null;
+    }
+}
+
+const ReduceCache = struct {
+    ctx: *runtime.Device,
+    n: usize,
+    buckets: usize,
+    input: runtime.Buffer,
+    partials: runtime.Buffer,
+    final: runtime.Buffer,
+    params_in: runtime.Buffer,
+    params_partials: runtime.Buffer,
+    binding: Binding,
+
+    fn init(ctx: *runtime.Device, n: usize, buckets: usize) !ReduceCache {
+        const input_bytes = inputBytes(n) orelse return error.GpuError;
+        const partial_bytes = std.math.mul(usize, buckets, @sizeOf(f32)) catch return error.GpuError;
+
+        var self = ReduceCache{
+            .ctx = ctx,
+            .n = n,
+            .buckets = buckets,
+            .input = undefined,
+            .partials = undefined,
+            .final = undefined,
+            .params_in = undefined,
+            .params_partials = undefined,
+            .binding = .{ .first = .{ null, null }, .second = .{ null, null } },
+        };
+        self.input = try runtime.Buffer.init(ctx, input_bytes, runtime.buffer.storage_r);
+        errdefer self.input.deinit(ctx);
+        self.partials = try runtime.Buffer.init(ctx, partial_bytes, runtime.buffer.storage_rw);
+        errdefer self.partials.deinit(ctx);
+        self.final = try runtime.Buffer.init(ctx, @sizeOf(f32), runtime.buffer.storage_rw);
+        errdefer self.final.deinit(ctx);
+        self.params_in = try runtime.Buffer.init(ctx, @sizeOf(Params), runtime.buffer.uniform);
+        errdefer self.params_in.deinit(ctx);
+        self.params_partials = try runtime.Buffer.init(ctx, @sizeOf(Params), runtime.buffer.uniform);
+        errdefer self.params_partials.deinit(ctx);
+        return self;
+    }
+
+    fn deinit(self: *ReduceCache) void {
+        releaseBinding(&self.binding);
+        self.params_partials.deinit(self.ctx);
+        self.params_in.deinit(self.ctx);
+        self.final.deinit(self.ctx);
+        self.partials.deinit(self.ctx);
+        self.input.deinit(self.ctx);
+    }
+};
+
+var kernels_cache: ?Kernels = null;
+var shape_cache: ?ReduceCache = null;
+var cache_mutex: std.atomic.Mutex = .unlocked;
+
+fn lock() void {
+    while (!cache_mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
+fn unlock() void {
+    cache_mutex.unlock();
+}
+
+pub fn resetCache() void {
+    lock();
+    defer unlock();
+    if (shape_cache) |*cache| cache.deinit();
+    shape_cache = null;
+    if (kernels_cache) |*kernels| kernels.deinit();
+    kernels_cache = null;
 }
 
 /// Number of pass-1 workgroups: one per 64 elements, capped at the device's
@@ -138,112 +227,42 @@ pub fn canRun(limits: context_mod.GpuLimits, n: usize) bool {
     return buckets > 0 and buckets <= limits.maxComputeWorkgroupsPerDimension;
 }
 
-fn ensurePipelines(ctx: *GpuContext, cache: *Cache) !void {
-    if (cache.bind_group_layout == null) {
-        var entries: [3]wgpu.WGPUBindGroupLayoutEntry = undefined;
-        for (&entries) |*entry| entry.* = std.mem.zeroes(wgpu.WGPUBindGroupLayoutEntry);
-        entries[0].binding = 0;
-        entries[0].visibility = wgpu.WGPUShaderStage_Compute;
-        entries[0].buffer.type = wgpu.WGPUBufferBindingType_ReadOnlyStorage;
-        entries[1].binding = 1;
-        entries[1].visibility = wgpu.WGPUShaderStage_Compute;
-        entries[1].buffer.type = wgpu.WGPUBufferBindingType_Storage;
-        entries[2].binding = 2;
-        entries[2].visibility = wgpu.WGPUShaderStage_Compute;
-        entries[2].buffer.type = wgpu.WGPUBufferBindingType_Uniform;
-
-        cache.bind_group_layout = try ctx.createBindGroupLayout(&wgpu.WGPUBindGroupLayoutDescriptor{
-            .nextInChain = null,
-            .label = emptyStringView(),
-            .entryCount = entries.len,
-            .entries = entries[0..].ptr,
-        });
+fn ensureKernels(ctx: *runtime.Device) !void {
+    if (kernels_cache) |*kernels| {
+        if (kernels.ctx.device == ctx.device) return;
+        kernels.deinit();
+        kernels_cache = null;
+        if (shape_cache) |*cache| cache.deinit();
+        shape_cache = null;
     }
-
-    inline for ([2][]const u8{ "sum_main", "max_main" }, 0..) |entry_point, index| {
-        const slot = &cache.pipelines[index];
-        if (slot.pipeline == null) {
-            try ctx.createKernelPipeline(slot, reduce_shader, entry_point, cache.bind_group_layout);
-        }
-    }
+    kernels_cache = try Kernels.init(ctx);
 }
 
-fn ensureBuffers(ctx: *GpuContext, cache: *Cache, n: usize, buckets: usize) !void {
-    if (cache.n == n and cache.buckets == buckets and cache.bind_group_in != null) return;
-
-    cache.deinitBuffers();
-    errdefer cache.deinitBuffers();
-
-    const input_bytes = inputBytes(n) orelse return error.GpuError;
-    const partial_bytes = std.math.mul(usize, buckets, @sizeOf(f32)) catch return error.GpuError;
-
-    cache.input = try ctx.createStorageBuffer(
-        input_bytes,
-        wgpu.WGPUBufferUsage_Storage | wgpu.WGPUBufferUsage_CopyDst,
-    );
-    cache.partials = try ctx.createStorageBuffer(
-        partial_bytes,
-        wgpu.WGPUBufferUsage_Storage,
-    );
-    cache.final = try ctx.createStorageBuffer(
-        @sizeOf(f32),
-        wgpu.WGPUBufferUsage_Storage | wgpu.WGPUBufferUsage_CopySrc,
-    );
-    cache.staging = try ctx.createStorageBuffer(
-        @sizeOf(f32),
-        wgpu.WGPUBufferUsage_MapRead | wgpu.WGPUBufferUsage_CopyDst,
-    );
-    cache.params_in = try ctx.createStorageBuffer(
-        @sizeOf(Params),
-        wgpu.WGPUBufferUsage_Uniform | wgpu.WGPUBufferUsage_CopyDst,
-    );
-    cache.params_partials = try ctx.createStorageBuffer(
-        @sizeOf(Params),
-        wgpu.WGPUBufferUsage_Uniform | wgpu.WGPUBufferUsage_CopyDst,
-    );
-
-    const bindings = [2]struct {
-        input: wgpu.WGPUBuffer,
-        output: wgpu.WGPUBuffer,
-        params: wgpu.WGPUBuffer,
-    }{
-        .{ .input = cache.input, .output = cache.partials, .params = cache.params_in },
-        .{ .input = cache.partials, .output = cache.final, .params = cache.params_partials },
-    };
-
-    var bind_groups = [2]wgpu.WGPUBindGroup{ null, null };
-    for (bindings, 0..) |binding_set, index| {
-        var entries: [3]wgpu.WGPUBindGroupEntry = undefined;
-        for (&entries) |*entry| entry.* = std.mem.zeroes(wgpu.WGPUBindGroupEntry);
-        const buffers = [3]wgpu.WGPUBuffer{
-            binding_set.input,
-            binding_set.output,
-            binding_set.params,
-        };
-        for (0..3) |binding| {
-            entries[binding].binding = @intCast(binding);
-            entries[binding].buffer = buffers[binding];
-            entries[binding].offset = 0;
-            entries[binding].size = wgpu.WGPU_WHOLE_SIZE;
+fn ensureShape(ctx: *runtime.Device, n: usize, buckets: usize) !*ReduceCache {
+    if (shape_cache) |*cache| {
+        if (cache.ctx.device == ctx.device and cache.n == n and cache.buckets == buckets) {
+            return cache;
         }
-        bind_groups[index] = try ctx.createBindGroup(&wgpu.WGPUBindGroupDescriptor{
-            .nextInChain = null,
-            .label = emptyStringView(),
-            .layout = cache.bind_group_layout,
-            .entryCount = entries.len,
-            .entries = entries[0..].ptr,
-        });
+        cache.deinit();
+        shape_cache = null;
     }
-    cache.bind_group_in = bind_groups[0];
-    cache.bind_group_partials = bind_groups[1];
 
-    cache.n = n;
-    cache.buckets = buckets;
+    var cache = try ReduceCache.init(ctx, n, buckets);
+    errdefer cache.deinit();
+    cache.binding = try bindAll(
+        &kernels_cache.?,
+        &cache.input,
+        &cache.partials,
+        &cache.final,
+        &cache.params_in,
+        &cache.params_partials,
+    );
+    shape_cache = cache;
+    return &shape_cache.?;
 }
 
 fn runImpl(
     ctx: *GpuContext,
-    cache: *Cache,
     op: Op,
     out: *f32,
     input: []const f32,
@@ -255,59 +274,41 @@ fn runImpl(
     const buckets = bucketCount(ctx.limits, n);
     if (buckets == 0) return error.GpuError;
 
-    if (cache.device != ctx.device) {
-        cache.deinit();
-        cache.device = ctx.device;
-    }
-    try ensurePipelines(ctx, cache);
-    try ensureBuffers(ctx, cache, n, buckets);
+    lock();
+    defer unlock();
 
-    ctx.writeBytes(cache.input, std.mem.sliceAsBytes(input));
+    try ensureKernels(ctx);
+    const cache = try ensureShape(ctx, n, buckets);
+
+    cache.input.markHostDirty();
+    try cache.input.toDevice(ctx, std.mem.sliceAsBytes(input));
     var params_in = Params{ .n = @intCast(n), .pad0 = 0, .pad1 = 0, .pad2 = 0 };
-    ctx.writeBytes(cache.params_in, std.mem.asBytes(&params_in));
+    cache.params_in.markHostDirty();
+    try cache.params_in.toDevice(ctx, std.mem.asBytes(&params_in));
     var params_partials = Params{ .n = @intCast(buckets), .pad0 = 0, .pad1 = 0, .pad2 = 0 };
-    ctx.writeBytes(cache.params_partials, std.mem.asBytes(&params_partials));
+    cache.params_partials.markHostDirty();
+    try cache.params_partials.toDevice(ctx, std.mem.asBytes(&params_partials));
 
     const index = opIndex(op);
-    ctx.beginErrorScope();
+    const kernel = kernels_cache.?.kernel(op);
+    const buffers_first = [3]*runtime.Buffer{ &cache.input, &cache.partials, &cache.params_in };
+    const buffers_second = [3]*runtime.Buffer{ &cache.partials, &cache.final, &cache.params_partials };
+    const grid_first = try kernel.gridLinear(buckets);
+    const grid_second = context_mod.WorkgroupGrid{ .x = 1, .y = 1 };
 
-    const encoder = wgpu.wgpuDeviceCreateCommandEncoder(ctx.device, null) orelse {
-        ctx.discardErrorScope();
-        return error.GpuError;
-    };
+    var chain = try runtime.Chain.begin(ctx);
+    defer chain.deinit();
     for (0..repetitions) |_| {
-        const pass = wgpu.wgpuCommandEncoderBeginComputePass(encoder, null) orelse {
-            wgpu.wgpuCommandEncoderRelease(encoder);
-            ctx.discardErrorScope();
-            return error.GpuError;
-        };
-        wgpu.wgpuComputePassEncoderSetPipeline(pass, cache.pipelines[index].pipeline);
-        wgpu.wgpuComputePassEncoderSetBindGroup(pass, 0, cache.bind_group_in, 0, null);
-        wgpu.wgpuComputePassEncoderDispatchWorkgroups(pass, @intCast(buckets), 1, 1);
-        // Pass 2 collapses the per-workgroup partials with a single workgroup.
-        wgpu.wgpuComputePassEncoderSetBindGroup(pass, 0, cache.bind_group_partials, 0, null);
-        wgpu.wgpuComputePassEncoderDispatchWorkgroups(pass, 1, 1, 1);
-        wgpu.wgpuComputePassEncoderEnd(pass);
-        wgpu.wgpuComputePassEncoderRelease(pass);
+        try chain.dispatch(kernel, cache.binding.first[index].?, &buffers_first, grid_first);
+        try chain.dispatch(kernel, cache.binding.second[index].?, &buffers_second, grid_second);
     }
-    wgpu.wgpuCommandEncoderCopyBufferToBuffer(
-        encoder,
-        cache.final,
-        0,
-        cache.staging,
-        0,
-        @sizeOf(f32),
-    );
-    try ctx.submitRecorded(encoder);
-
-    try ctx.readBuffer(cache.staging, std.mem.asBytes(out));
+    try chain.download(&cache.final, std.mem.asBytes(out));
+    try chain.submit();
 }
 
 /// Reduce `input` into `out` with the process-local GPU context and cache.
 pub fn runWithContext(ctx: *GpuContext, op: Op, out: *f32, input: []const f32) !void {
-    lockCache();
-    defer unlockCache();
-    return runImpl(ctx, &global_cache, op, out, input, 1);
+    return runImpl(ctx, op, out, input, 1);
 }
 
 /// Steady-state variant: upload once, run `repetitions` real two-pass
@@ -319,9 +320,7 @@ pub fn runBatchedWithContext(
     input: []const f32,
     repetitions: usize,
 ) !void {
-    lockCache();
-    defer unlockCache();
-    return runImpl(ctx, &global_cache, op, out, input, repetitions);
+    return runImpl(ctx, op, out, input, repetitions);
 }
 
 pub fn reduce(op: Op, out: *f32, input: []const f32) !void {

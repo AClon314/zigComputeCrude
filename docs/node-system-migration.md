@@ -297,6 +297,13 @@ docs/ tools/                # 保持
    属于**中间件**；本库只提供它们需要的原语与调度。`Shader nodes` 是独立的
    编译器项目，不在本库范围。
 
+**Step 5c（M1 迁移，已完成）**：`gpu/reduce.zig` 同样迁到 runtime（`Kernels` +
+`bindAll`/`Binding` 提供两趟的 4 个 bind group，`ReduceCache` 按 device+shape 常驻；
+slice API 不变），并把 `chain_bench` 的 GEMM/reduce 设置改为直接用这两个模块的
+`Kernels`（删掉重复的 kernel 初始化）。至此**全部内置 kernel 都在 runtime 路径上**，
+`GpuContext` 不再持有任何 kernel/buffer cache。reduce 稳态因两趟同链而提升：
+4M sum batch 14.3 → 19.3 GB/s、16M sum 25.1 → 26.3 GB/s（ReleaseFast）。
+
 **Step 5b（M1 迁移，已实现）**：`gpu/gemm.zig` 迁到 runtime：新增 `Kernels`
 （编译好的 simple/tiled pipeline + `bind`，可在任意 Chain 里用调用方自己的 buffer
 组合）、`gridFor`（2D 展平 / tile grid）、`VariantCache`（按 device+shape 的常驻 buffer
