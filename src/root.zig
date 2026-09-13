@@ -8,6 +8,7 @@ const gpu_context = @import("gpu/context.zig");
 const gpu_pipeline = @import("gpu/pipeline.zig");
 const gpu_gemm = @import("gpu/gemm.zig");
 const runtime_mod = @import("runtime.zig");
+const primitives_mod = @import("primitives.zig");
 const chain_bench_mod = @import("chain_bench.zig");
 const gpu_reduce = @import("gpu/reduce.zig");
 
@@ -18,6 +19,7 @@ pub const ComputeEngine = engine.ComputeEngine;
 pub const bench = bench_mod;
 pub const gpu = gpu_pipeline;
 pub const runtime = runtime_mod;
+pub const primitives = primitives_mod;
 pub const chain_bench = chain_bench_mod;
 pub const gemm = gpu_gemm;
 pub const reduce = gpu_reduce;
@@ -58,6 +60,7 @@ test {
     _ = gpu_gemm;
     _ = gpu_reduce;
     _ = runtime_mod;
+    _ = primitives_mod;
     _ = chain_bench_mod;
 }
 

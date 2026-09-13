@@ -280,7 +280,7 @@ docs/ tools/                # 保持
 | **M1 通用 dispatch** | 库内 | `KernelSpec` + 通用 grid/绑定 + 异步 readback + GPU timestamp | 同一 kernel 描述在 CPU/GPU 都能跑且对拍通过；加新 kernel 只写 1 WGSL + 1 spec |
 | **M2 图像与图调度** | 库内 | 2D tile、逐像素/可分离卷积/金字塔、kernel 融合、通用 op-graph 调度（IR 雏形） | 一张融合后的图像 op-graph 与逐算子实现逐元素对拍；融合前后 profile |
 | **M2' Blender 合成节点** | 中间件 | 合成节点语义、OCIO 色彩策略、图像源/缓存 | 与 Blender 参考输出对拍；不进本库里程碑 |
-| **M3 原语补齐** | 库内 | atomics/scan/sort/compaction/indirect + texture/sampler/format/mip 子集 | 纹理噪声跨后端一致；compaction 与 CPU 对拍 |
+| **M3 原语补齐**（进行中） | 库内 | ✅ scan（u32 排他前缀和，3 段链 + CPU 对拍）、✅ indirect dispatch（ABI 32 符号 + 测试）；⬜ atomics/sort/compaction、texture/sampler/format/mip | 纹理噪声跨后端一致；compaction 与 CPU 对拍 |
 | **S1 空间原语（按需）** | 库内候选 | BVH 构建/遍历、空间哈希、邻域查询——**只在出现具体消费方（碰撞/几何/光追任一个）时启动**，不预埋 | 该消费方的 workload 对拍 + 消融（相对暴力解法） |
 | — | 中间件 | Blender 域模型（point/face/corner/spline/instance/volume）、属性传播语义、字段求值、Simulation/Repeat/For-Each zone、bake/cache 策略、节点解析与节点语义 | 不在本库；由消费方实现与验收 |
 | 独立立项 | 库外 | **Shader nodes**：SVM→WGSL 编译器 + 纹理/采样/导数 | 不在本库主线内，单独立项评估 |
@@ -296,6 +296,12 @@ docs/ tools/                # 保持
 3. 所有 Blender 语义（节点类型、域模型、属性传播、色彩策略、外部库集成）
    属于**中间件**；本库只提供它们需要的原语与调度。`Shader nodes` 是独立的
    编译器项目，不在本库范围。
+
+**Step 2（M3 起步，已实现）**：`src/primitives/scan.zig` 提供 u32 排他前缀和
+（block_scan → block_scan_global → scan_apply 三段记录进一条 Chain，CPU 参考对拍，
+含 1~4097 的边界尺寸）；`Chain.dispatchIndirect` + `wgpuComputePassEncoderDispatchWorkgroupsIndirect`
+绑定（ABI 子集 31 → 32 符号）。踩到并记录了 wgpu 的 usage-scope 排他规则：
+indirect buffer 不能在同一 dispatch 里再绑成 storage（拆两次 dispatch/两个 shader）。
 
 **Step 1（模块化，已实现）**：发布形态拆成一个包两个 module——
 `computeAccel`（CPU/GPU/runtime/原语）与 `computeAccel_spatial`（S1 空间原语），

@@ -61,6 +61,9 @@ tools/check_abi_drift.sh            # 绑定 ABI 漂移检查（native vs emdawn
 | `computeAccel` | CPU 内核、GPU 后端（native wgpu-native / browser emdawnwebgpu）、runtime（Buffer/Kernel/Chain）、GEMM/reduce 等原语、能力探测与选择 | wgpu-native 可通过 `b.dependency(..., .{ .webgpu = false })` 关闭（CPU-only 消费者） |
 | `computeAccel_spatial` | 与领域无关的空间原语（S1）：均匀网格索引（build + 半径查询，当前为 CPU 参考实现，GPU kernel 后续加入） | 无额外链接（复用 `computeAccel`） |
 
+`computeAccel` 内的 `primitives/` 放领域无关的并行原语（当前：`scan`），
+每个都带 CPU 参考实现与逐元素对拍测试。
+
 ```zig
 // 消费者 build.zig
 const accel = b.dependency("computeAccel", .{ .target = target, .optimize = optimize });

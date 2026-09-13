@@ -87,6 +87,7 @@ SYMBOLS=(
     wgpuCommandEncoderCopyBufferToBuffer wgpuCommandEncoderFinish
     wgpuComputePassEncoderSetPipeline
     wgpuComputePassEncoderSetBindGroup wgpuComputePassEncoderDispatchWorkgroups
+    wgpuComputePassEncoderDispatchWorkgroupsIndirect
     wgpuComputePassEncoderEnd wgpuDeviceCreateBuffer wgpuQueueWriteBuffer
     wgpuQueueSubmit wgpuBufferMapAsync wgpuBufferGetMappedRange wgpuBufferUnmap
     wgpuBufferGetConstMappedRange

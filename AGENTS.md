@@ -145,3 +145,12 @@ tree-shake 门禁有正负两侧：`build.zig` 里的 probe 只调用 CPU 路径
   在浏览器端需要由 rAF pump 驱动（移植时注意）。
 - **测量失真**：纯归约会被 LICM 提出循环（`timeReduceCpu` 每轮扰动一个元素）；
   基准先 warmup 再计时（`--kernel chain` 已内置）。
+- **indirect buffer 的 usage 排他**：同一个 dispatch 里，buffer 不能既作为
+  `dispatchIndirect` 的来源又绑定为 storage（wgpu usage scope 报
+  "STORAGE_READ_WRITE ... cannot be used with ... INDIRECT"，且 `wgpuQueueSubmit`
+  对 validation error 直接 abort）。做法：写 count 与间接派发拆成两次 dispatch、
+  两个 shader（参见 `indirect_probe.wgsl` / `indirect_fill.wgsl` 与
+  `Chain.dispatchIndirect` 的测试）；control buffer 用 `runtime.buffer.indirect`。
+- **scan 的块内分配必须连续**：单 workgroup 扫块前缀和时，每个线程要拿**连续**块
+  （`[lid*chunk, (lid+1)*chunk)`），跨步分块会破坏前缀顺序（已在
+  `scan.wgsl::block_scan_global` 修正）。

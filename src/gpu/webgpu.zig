@@ -37,6 +37,7 @@ pub const WGPUBufferUsage_CopySrc: WGPUBufferUsage = 0x0004;
 pub const WGPUBufferUsage_CopyDst: WGPUBufferUsage = 0x0008;
 pub const WGPUBufferUsage_Uniform: WGPUBufferUsage = 0x0040;
 pub const WGPUBufferUsage_Storage: WGPUBufferUsage = 0x0080;
+pub const WGPUBufferUsage_Indirect: WGPUBufferUsage = 0x0100;
 
 pub const WGPUMapMode_Read: WGPUMapMode = 0x0001;
 pub const WGPUShaderStage_Compute: WGPUShaderStage = 0x0004;
@@ -419,6 +420,14 @@ pub extern fn wgpuComputePassEncoderSetBindGroup(
     dynamicOffsetCount: usize,
     dynamicOffsets: ?[*]const u32,
 ) void;
+/// Dispatch count itself lives in a buffer (dynamic work sizes: compaction,
+/// spatial queries).  Argument order matches webgpu.h in both implementations.
+pub extern fn wgpuComputePassEncoderDispatchWorkgroupsIndirect(
+    computePassEncoder: WGPUComputePassEncoder,
+    indirectBuffer: WGPUBuffer,
+    indirectOffset: u64,
+) void;
+
 pub extern fn wgpuComputePassEncoderDispatchWorkgroups(
     computePassEncoder: WGPUComputePassEncoder,
     workgroupCountX: u32,

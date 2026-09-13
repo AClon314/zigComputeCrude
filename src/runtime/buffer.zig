@@ -28,6 +28,10 @@ pub const storage_rw = wgpu.WGPUBufferUsage_Storage |
     wgpu.WGPUBufferUsage_CopyDst |
     wgpu.WGPUBufferUsage_CopySrc;
 pub const uniform = wgpu.WGPUBufferUsage_Uniform | wgpu.WGPUBufferUsage_CopyDst;
+/// Storage buffer that also feeds `dispatchIndirect` (control/count buffers).
+pub const indirect = wgpu.WGPUBufferUsage_Storage |
+    wgpu.WGPUBufferUsage_CopyDst |
+    wgpu.WGPUBufferUsage_Indirect;
 
 pub const Buffer = struct {
     handle: wgpu.WGPUBuffer = null,
