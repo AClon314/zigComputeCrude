@@ -51,7 +51,7 @@ Blender/节点的语义（域模型、属性传播、节点图求值、色彩/�
 
 | module | 归属内容 | 规则 |
 |---|---|---|
-| `computeAccel` | CPU 内核、GPU 后端、runtime、通用原语、探测/选择 | wgpu 链接可用 `-Dwebgpu=false` 关掉；不得 import `computeAccel_spatial` |
+| `computeAccel` | CPU 内核、GPU 后端、runtime、通用原语（`primitives/`）、探测/选择 | wgpu 链接可用 `-Dwebgpu=false` 关掉；不得 import `computeAccel_spatial`；新 kernel 一律走 runtime，不新增 kernel 内建 cache |
 | `computeAccel_spatial` | 领域无关的空间原语（S1）：均匀网格索引（GPU build+query，CPU 参考对拍） | 只能依赖 `computeAccel` 的公开 API；不得被主 module 反向 import；GPU 布局保持 WebGPU 基线（≤8 storage binding/阶段，AoS vec4 是为此的取舍） |
 
 新增一类功能（图像、物理、其他域）= **新增一个 module**，不要塞进主 module。
@@ -78,7 +78,8 @@ src/chain_bench.zig   # M0 消融基准（saxpy 链、GEMM→bias→reduce 链�
 v2 目标布局（迁移路径见 `docs/node-system-migration.md` §6）：`runtime/`、
 `backends/{cpu,webgpu}/`、`primitives/`、`determinism.zig`、`capability.zig`。
 迁移规则：**旧的按 kernel 划分的 shape-keyed cache 逐步并入 runtime.Buffer**，
-新内核一律走 `runtime.Kernel` + `Chain`。
+新内核一律走 `runtime.Kernel` + `Chain`。add/saxpy 已迁移（见
+`primitives/elementwise.zig`；`gpu/pipeline.zig` 是兼容 shim），gemm/reduce 待迁。
 
 依赖方向（无环）：`root` → 各模块；`runtime` → `gpu/context` + `gpu/webgpu`；
 `chain_bench` → `runtime` + 参考实现；`gpu/*` 不反向依赖 `runtime`。

@@ -297,6 +297,14 @@ docs/ tools/                # 保持
    属于**中间件**；本库只提供它们需要的原语与调度。`Shader nodes` 是独立的
    编译器项目，不在本库范围。
 
+**Step 5a（M1 迁移，已实现）**：`add`/`saxpy` 从 `gpu/pipeline.zig` 的内建
+kernel cache（`GpuContext.pipelines/resources` + `layoutEntries/ensurePipeline/
+ensureResources/dispatchMany`）迁到 runtime：新 `primitives/elementwise.zig` 只有
+"每 kernel 一个 Runner（Kernel + 常驻 buffer + bind group，按 device/size 缓存）+
+execute"，`gpu/pipeline.zig` 退化为兼容 shim；`GpuContext` 删掉 pipelines/resources
+双轨（-34 行）。行为不变（每次调用上传/回读），实测 add 端到端 3.85 GB/s、
+gpu_batch 22.8 GB/s（ReleaseFast，1<<20）。gemm/reduce 待迁。
+
 **Step 4（M3 compaction，已实现）**：`src/primitives/compaction.zig` 用 scan +
 scatter 实现 stream compaction，并把压缩后的长度写进一个 `Indirect` usage 的
 3×u32 count buffer（`[len, 1, 1]`），可直接喂给 `Chain.dispatchIndirect`；

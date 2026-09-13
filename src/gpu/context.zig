@@ -155,29 +155,6 @@ pub const PipelineCache = struct {
     }
 };
 
-pub const BufferCache = struct {
-    byte_size: usize = 0,
-    storage: [3]wgpu.WGPUBuffer = .{ null, null, null },
-    params: wgpu.WGPUBuffer = null,
-    staging: wgpu.WGPUBuffer = null,
-    bind_group: wgpu.WGPUBindGroup = null,
-
-    pub fn deinit(self: *BufferCache) void {
-        if (self.bind_group) |handle| wgpu.wgpuBindGroupRelease(handle);
-        self.bind_group = null;
-
-        for (&self.storage) |*buffer| {
-            if (buffer.*) |handle| wgpu.wgpuBufferRelease(handle);
-            buffer.* = null;
-        }
-        if (self.params) |handle| wgpu.wgpuBufferRelease(handle);
-        self.params = null;
-        if (self.staging) |handle| wgpu.wgpuBufferRelease(handle);
-        self.staging = null;
-        self.byte_size = 0;
-    }
-};
-
 const AdapterRequestState = struct {
     done: bool = false,
     status: wgpu.WGPURequestAdapterStatus = 0,
@@ -268,13 +245,6 @@ pub const GpuContext = struct {
     limits: GpuLimits = .{},
     adapter_backend_type: wgpu.WGPUBackendType = wgpu.WGPUBackendType_Undefined,
     adapter_vendor_id: u32 = 0,
-
-    // Index 0 = add, index 1 = saxpy.  Pipeline and bind-group resources are
-    // kept alive across calls so a benchmark does not rebuild a pipeline per
-    // dispatch.  Buffer resources are replaced only when the requested size
-    // changes.
-    pipelines: [2]PipelineCache = .{ .{}, .{} },
-    resources: [2]BufferCache = .{ .{}, .{} },
 
     /// Explicit context construction keeps the original small `GpuError`
     /// contract.  The one-time probe below uses `initDetailed` so it can tell
@@ -385,10 +355,6 @@ pub const GpuContext = struct {
     }
 
     pub fn deinit(self: *GpuContext) void {
-        // Bind groups reference buffers and layouts, so release them first.
-        for (&self.resources) |*resources| resources.deinit();
-        for (&self.pipelines) |*pipeline| pipeline.deinit();
-
         if (self.queue) |handle| wgpu.wgpuQueueRelease(handle);
         self.queue = null;
         if (self.device) |handle| wgpu.wgpuDeviceRelease(handle);

@@ -3,9 +3,12 @@
 //! Added on demand (docs/node-system-migration.md M3): only algorithms that a
 //! concrete workload needed, with a CPU reference and element-wise comparison.
 
+pub const elementwise = @import("primitives/elementwise.zig");
 pub const scan = @import("primitives/scan.zig");
 pub const compaction = @import("primitives/compaction.zig");
 
+pub const elementwiseAdd = elementwise.add;
+pub const elementwiseSaxpy = elementwise.saxpy;
 pub const Scanner = scan.Scanner;
 pub const ScanBinding = scan.Binding;
 pub const referenceExclusiveScan = scan.referenceExclusiveScan;
@@ -16,6 +19,7 @@ pub const CompactionBinding = compaction.Binding;
 pub const referenceCompact = compaction.referenceCompact;
 
 test {
+    _ = elementwise;
     _ = scan;
     _ = compaction;
 }
