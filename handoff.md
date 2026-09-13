@@ -15,9 +15,10 @@
 | `zig build test` | ✅ 24/24 绿（原 15 + 新增 9）；GPU 测试实际执行、无 skip |
 | `zig build wasm` | ✅ 改动后重跑成功（新 kernel 只在 native 路径，wasm 仍只跑 add） |
 | `tools/check_abi_drift.sh` | ✅ OK（未改绑定） |
-| README（新 kernel 说明 + 实测数字 + 踩坑） | ✅ 已更新 |
+| README（新 kernel 说明 + 实测数字 + 踩坑） | ✅ 已更新（含新增 kernel 清单、CPU SIMD 边界） |
+| CPU SIMD 审查（FMA / 自适应位宽）与“两份实现”的统一 | ✅ 见 §6（净删 ~140 行重复 plumbing） |
 | 1024³ 多次迭代的 wgpu-native abort | ✅ 已修复，根因见 §3 |
-| `git commit` | ✅ `9042bbd`（工作区干净） |
+| `git commit` | ✅ `ddbd660`（Step 3）+ `b44280d`（SIMD/统一，见 §6）（工作区干净） |
 
 ## 1. 交付内容
 
@@ -147,3 +148,36 @@ tools/check_abi_drift.sh                        # 未改绑定，OK
 - reduce 若要真正赢，应在 Step 1 之后用于「输入已常驻显存」的链路，而不是拿它和
   CPU 做纯流式读的对比。
 - 浏览器端目前只跑 add；新 kernel 的 WGSL 与绑定是共享的，移植是机械工作。
+
+## 6. 追加：CPU SIMD 审查与「两份实现」的统一
+
+起因：`zig-simd-bad.md` 收集了社区对 Zig `@Vector` 的批评（无自动广播、无
+rcp/gather/scatter/bf16/mask、`@sin` 退化标量循环、inline asm 不能传向量寄存器、
+位宽写死等）。逐条对照后结论：**都不适用于本项目的 kernel**（只用 `+ * max` +
+规则访存），但顺带发现并修了两个真实问题：
+
+- Zig 严格浮点默认**不生成 FMA**（dump asm：saxpy 是 `vmulps`+`vaddps`；GEMM 每 32
+  个 MAC 要 8 条算术指令）。`engine.zig` 的 saxpy、`gemm.zig` 的 `referenceSimd`
+  改用 `@mulAdd`，x86 生成 `vfmadd213ps`；
+- `@Vector(8, T)` 位宽写死 → 改用 `std.simd.suggestVectorLength(T)`（本机 AVX2=8，
+  AVX-512/NEON/wasm 自适应）。
+
+实测上限（临时探针，16 MiB×3 流，ReleaseFast）：add 4/8/16 宽 = 23.0/25.4/26.8 GB/s，
+saxpy mul+add/FMA = 25.0/25.4，memcpy 22.9、memset 26.6 GB/s —— 全部贴在 ~23–27 GB/s
+的内存带宽上，说明这些 kernel 是**带宽受限**而非 SIMD 受限（GEMM 的 CPU 侧同样）。
+
+同时按你的提问把「两份实现」的约定固定下来（写进 README）：
+
+- **语言无法合并**：浏览器端只吃 WGSL（拒 SPIR-V），Zig 没有 WGSL 后端，CPU 与 GPU
+  是两种执行模型；要“一份源码两端生成”得自写 DSL/codegen，超范围。
+- **统一的是管线与约定**：公共 plumbing 收进 `GpuContext`
+  （`createKernelPipeline`/`createStorageBuffer`/`writeBytes`/`submitRecorded`/
+  `readBuffer`/`workgroupGrid`），add/saxpy/gemm/reduce 共用一套（readback 只剩一条
+  实现）；每个 kernel 的 Zig 文件只剩「WGSL embed + 绑定布局 + params + dispatch
+  + CPU 参考」；契约是两边逐元素对拍（测试 + CLI `max|diff|`）。
+- README 增加「新增一个 kernel 的清单」与「CPU SIMD 的边界」两节。
+
+改动：`engine.zig`、`context.zig`、`gemm.zig`、`reduce.zig`、`pipeline.zig`
+（净删除约 140 行重复 plumbing）；重新验收：`zig build test` 24/24、
+`zig build wasm` 成功、ABI OK、`--backend gpu_webgpu --size 4194304/8388608` 无回退、
+三条 kernel 路径实测正常。

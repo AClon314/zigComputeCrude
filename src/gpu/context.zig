@@ -138,7 +138,21 @@ pub const PipelineCache = struct {
     shader_module: wgpu.WGPUShaderModule = null,
     pipeline: wgpu.WGPUComputePipeline = null,
     pipeline_layout: wgpu.WGPUPipelineLayout = null,
+    /// Owned when set.  Kernel variants that share one bind group layout (GEMM
+    /// simple/tiled, reduce sum/max) leave this null and keep the shared layout
+    /// in their own cache, so `deinit` never double-releases it.
     bind_group_layout: wgpu.WGPUBindGroupLayout = null,
+
+    pub fn deinit(self: *PipelineCache) void {
+        if (self.pipeline) |handle| wgpu.wgpuComputePipelineRelease(handle);
+        self.pipeline = null;
+        if (self.pipeline_layout) |handle| wgpu.wgpuPipelineLayoutRelease(handle);
+        self.pipeline_layout = null;
+        if (self.bind_group_layout) |handle| wgpu.wgpuBindGroupLayoutRelease(handle);
+        self.bind_group_layout = null;
+        if (self.shader_module) |handle| wgpu.wgpuShaderModuleRelease(handle);
+        self.shader_module = null;
+    }
 };
 
 pub const BufferCache = struct {
@@ -373,16 +387,7 @@ pub const GpuContext = struct {
     pub fn deinit(self: *GpuContext) void {
         // Bind groups reference buffers and layouts, so release them first.
         for (&self.resources) |*resources| resources.deinit();
-        for (&self.pipelines) |*pipeline| {
-            if (pipeline.pipeline) |handle| wgpu.wgpuComputePipelineRelease(handle);
-            pipeline.pipeline = null;
-            if (pipeline.pipeline_layout) |handle| wgpu.wgpuPipelineLayoutRelease(handle);
-            pipeline.pipeline_layout = null;
-            if (pipeline.bind_group_layout) |handle| wgpu.wgpuBindGroupLayoutRelease(handle);
-            pipeline.bind_group_layout = null;
-            if (pipeline.shader_module) |handle| wgpu.wgpuShaderModuleRelease(handle);
-            pipeline.shader_module = null;
-        }
+        for (&self.pipelines) |*pipeline| pipeline.deinit();
 
         if (self.queue) |handle| wgpu.wgpuQueueRelease(handle);
         self.queue = null;
@@ -455,6 +460,99 @@ pub const GpuContext = struct {
         defer wgpu.wgpuBufferUnmap(buffer);
         const mapped_bytes = @as([*]const u8, @ptrCast(mapped))[0..out.len];
         @memcpy(out, mapped_bytes);
+    }
+
+    /// Create an owned storage/uniform buffer with the context's error scope.
+    /// Every kernel module uses this instead of repeating the descriptor.
+    pub fn createStorageBuffer(
+        self: *GpuContext,
+        byte_size: usize,
+        usage: wgpu.WGPUBufferUsage,
+    ) !wgpu.WGPUBuffer {
+        return self.createBuffer(&wgpu.WGPUBufferDescriptor{
+            .nextInChain = null,
+            .label = emptyStringView(),
+            .usage = usage,
+            .size = @intCast(byte_size),
+            .mappedAtCreation = 0,
+        });
+    }
+
+    /// Copy host bytes into a buffer, used for every storage/uniform upload.
+    pub fn writeBytes(self: *GpuContext, buffer: wgpu.WGPUBuffer, bytes: []const u8) void {
+        wgpu.wgpuQueueWriteBuffer(
+            self.queue,
+            buffer,
+            0,
+            @as(?*const anyopaque, @ptrCast(bytes.ptr)),
+            bytes.len,
+        );
+    }
+
+    /// Compile one WGSL module into `slot` with the given (possibly shared)
+    /// bind group layout.  `entry_point` is comptime so the string view stays
+    /// allocation-free, matching the rest of the ABI layer.
+    pub fn createKernelPipeline(
+        self: *GpuContext,
+        slot: *PipelineCache,
+        shader_code: []const u8,
+        comptime entry_point: []const u8,
+        bind_group_layout: wgpu.WGPUBindGroupLayout,
+    ) !void {
+        errdefer slot.deinit();
+
+        var bind_group_layouts = [1]wgpu.WGPUBindGroupLayout{bind_group_layout};
+        slot.pipeline_layout = try self.createPipelineLayout(&wgpu.WGPUPipelineLayoutDescriptor{
+            .nextInChain = null,
+            .label = emptyStringView(),
+            .bindGroupLayoutCount = bind_group_layouts.len,
+            .bindGroupLayouts = bind_group_layouts[0..].ptr,
+            .immediateSize = 0,
+        });
+
+        var shader_source = wgpu.WGPUShaderSourceWGSL{
+            .chain = .{
+                .next = null,
+                .sType = wgpu.WGPUSType_ShaderSourceWGSL,
+            },
+            .code = .{ .data = shader_code.ptr, .length = shader_code.len },
+        };
+        slot.shader_module = try self.createShaderModule(&wgpu.WGPUShaderModuleDescriptor{
+            .nextInChain = @ptrCast(&shader_source.chain),
+            .label = emptyStringView(),
+        });
+
+        slot.pipeline = try self.createComputePipeline(&wgpu.WGPUComputePipelineDescriptor{
+            .nextInChain = null,
+            .label = emptyStringView(),
+            .layout = slot.pipeline_layout,
+            .compute = .{
+                .nextInChain = null,
+                .module = slot.shader_module,
+                .entryPoint = stringView(entry_point),
+                .constantCount = 0,
+                .constants = null,
+            },
+        });
+    }
+
+    /// Finish and submit an encoder, then check the error scope that the caller
+    /// pushed before recording.  This is the single submit path for all kernels.
+    pub fn submitRecorded(self: *GpuContext, encoder: wgpu.WGPUCommandEncoder) !void {
+        const command_buffer = wgpu.wgpuCommandEncoderFinish(encoder, null) orelse {
+            wgpu.wgpuCommandEncoderRelease(encoder);
+            self.discardErrorScope();
+            return error.GpuError;
+        };
+        wgpu.wgpuCommandEncoderRelease(encoder);
+
+        var commands = [1]wgpu.WGPUCommandBuffer{command_buffer};
+        wgpu.wgpuQueueSubmit(self.queue, 1, commands[0..].ptr);
+        self.endErrorScope() catch |err| {
+            wgpu.wgpuCommandBufferRelease(command_buffer);
+            return err;
+        };
+        wgpu.wgpuCommandBufferRelease(command_buffer);
     }
 
     pub fn beginErrorScope(self: *GpuContext) void {
@@ -565,6 +663,10 @@ pub const GpuContext = struct {
 
 fn emptyStringView() wgpu.WGPUStringView {
     return .{ .data = null, .length = wgpu.WGPU_STRLEN };
+}
+
+fn stringView(comptime text: []const u8) wgpu.WGPUStringView {
+    return .{ .data = text.ptr, .length = text.len };
 }
 
 var global_context: ?GpuContext = null;

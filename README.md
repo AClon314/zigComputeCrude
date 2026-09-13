@@ -114,17 +114,19 @@ dispatch、回读一次（steady-state）。所有对拍 `max|diff| = 0`。
 
 | workload | cpu_simd | gpu_simple e2e | gpu_tiled e2e | gpu_tiled batch |
 |---|---|---|---|---|
-| 512³, iters=10 | 35.4 GFLOP/s | 71.1 (2.0x) | **164.8 (4.7x)** | 219.0 (6.2x) |
-| 1024³, iters=5 | 22.4 | 27.0 (1.2x) | **188.6 (8.4x)** | 223.7 (10.0x) |
-| 2048³, iters=3（tiled） | 12.7 | — | **212.8 (16.7x)** | 230.0 (18.1x) |
+| 512³, iters=10 | 33.3 GFLOP/s | 79.0 (2.4x) | **173.0 (5.2x)** | 218.2 (6.6x) |
+| 1024³, iters=5 | 17.8 | 28.8 (1.6x) | **196.3 (11.0x)** | 226.8 (12.7x) |
+| 2048³, iters=3（tiled） | 12.5 | — | **215.1 (17.3x)** | 230.4 (18.5x) |
 
-reduce（GB/s 按输入字节；Debug/ReleaseFast 趋势一致，这里取 ReleaseFast）：
+（表中为 3 次运行的中位数；本机非独占，CPU 行随负载/频率有 ±10% 波动。）
+
+reduce（GB/s 按输入字节）：
 
 | workload | cpu_simd | gpu e2e | gpu batch |
 |---|---|---|---|
-| 4M sum, iters=10 | 30.5 GB/s | 5.7 (0.19x) | 13.1 (0.43x) |
-| 4M max, iters=10 | 28.2 | 6.0 | 14.1 |
-| 16M sum, iters=10 | 25.8 | 7.1 (0.27x) | 25.5 (≈1.0x) |
+| 4M sum, iters=10 | 30.5 GB/s | 6.1 (0.20x) | 14.3 (0.47x) |
+| 4M max, iters=10 | 30.1 | 6.2 | 14.5 |
+| 16M sum, iters=10 | 25.5 | 7.0 (0.28x) | 25.1 (≈1.0x) |
 
 诚实结论：
 
@@ -137,14 +139,80 @@ reduce（GB/s 按输入字节；Debug/ReleaseFast 趋势一致，这里取 Relea
   reduce 真正有价值的场景是数据本来就常驻显存（见路线图的 Step 1 链式 workload）。
 - `gpu_batch` 仍是 steady-state 观察项，不参与 `--auto` 选择，也不能和端到端数字混称。
 
+## CPU SIMD 与 GPU kernel 为什么是两份实现
+
+每个 kernel 是 **1 个 WGSL + 1 个 Zig** 的配对：
+
+| 侧 | 文件 | 职责 |
+|---|---|---|
+| CPU | `engine.zig`、`gemm.zig`/`reduce.zig` 里的 `reference*` | 参考实现 / 回退路径；纯 Zig 循环（带 `@Vector` SIMD） |
+| 编排 | 同一个 Zig 文件 | 编译 WGSL、建 buffer/bind group、dispatch、提交、回读、limits 校验、与 CPU 对拍 |
+| GPU | `shaders/*.wgsl` | 真正的并行运算本体（invocation / workgroup / barrier） |
+
+**不能合成一份源码的原因**（不是懒）：
+
+- 浏览器端（emdawnwebgpu）**只接受 WGSL**、明确拒绝 SPIR-V，所以 WGSL 这份无论如何都要有；
+- Zig 目前没有 WGSL 后端；Zig → SPIR-V 只能给 native/Vulkan 用（且本项目硬性禁用 SPIR-V），也解决不了浏览器的第二份；
+- CPU 是标量循环、GPU 是 invocation/workgroup 模型，要“一份源码两端生成”得自己写 DSL/codegen（等于小编译器），超出本 demo。
+
+所以这里的“统一”是**统一管线与约定**，而不是统一语言：
+
+- 公共 plumbing 全部收进 `GpuContext`：`createKernelPipeline` / `createStorageBuffer` /
+  `writeBytes` / `submitRecorded` / `readBuffer` / `workgroupGrid`+`canRun`；
+  `add`/`saxpy`/`gemm`/`reduce` 四条路径共用同一套（readback 只有一条实现）；
+- 每个 kernel 的 Zig 文件只剩：WGSL embed + 绑定布局 + params 结构 + dispatch/grid + CPU 参考；
+- 两份文件之间的契约就是**逐元素对拍**：同一 shape 下 WGSL 结果必须与 Zig 参考一致
+  （测试与 CLI 都打印 `max|diff|`），这也是“改了 WGSL 忘了改 Zig”能被立刻发现的原因。
+
+新增一个 kernel 的清单：
+
+1. 写 `<name>.wgsl`（定好 entry point 与 binding 顺序/类型）；
+2. 写 `src/gpu/<name>.zig`：`@embedFile`、params 的 extern struct、bind group layout、
+   按 `(device, shape)` 的 cache、`canRun` 边界、`*WithContext` 入口、CPU 参考；
+3. 加测试：CPU scalar vs SIMD（边角 shape）、GPU vs CPU（容差）；
+4. 需要 CLI/基准时，在 `main.zig` 加 `--kernel <name>` 分支与计时；
+5. `zig build test` + `zig build wasm`（不动 wasm 路径也做回归）+ `tools/check_abi_drift.sh`。
+
+## CPU SIMD 的边界：`@Vector` 会不会成为瓶颈
+
+社区里对 Zig SIMD 的批评（见 `zig-simd-bad.md`：无自动广播、无 rcp/AVX-512 特殊指令、
+无 gather/scatter/bf16/mask、`@sin` 会退化为标量循环、inline asm 不能传向量寄存器、
+位宽写死等）逐条对照本项目的 kernel：**都不适用**——我们只用 `+ * max`、访存规则
+（连续或等步长），不需要上述任何能力。但确实有两个值得修的通用点，本次已修：
+
+- **默认不生成 FMA**：Zig 严格浮点不会把 `a*b+c` 收缩为 FMA（dump asm 可见全是
+  `vmulps`+`vaddps`）。`saxpy`/GEMM 现改用 `@mulAdd`，x86 生成 `vfmadd213ps`；
+- **位宽写死**：原来硬编码 `@Vector(8, f32)`，现用 `std.simd.suggestVectorLength(f32)`
+  （本机 AVX2=8；AVX-512/NEON/wasm 自适应）。
+
+实测这两个改动的上限（临时探针，16 MiB×3 流，ReleaseFast）：
+
+| 变体 | GB/s |
+|---|---|
+| add 4-wide | 23.0 |
+| add 8-wide (AVX2) | 25.4 |
+| add 16-wide | 26.8 |
+| saxpy mul+add | 25.0 |
+| saxpy FMA | 25.4 |
+| memcpy (r+w) | 22.9 |
+| memset (w) | 26.6 |
+
+所有变体都贴在 **~23–27 GB/s 的内存带宽**上：4 宽→16 宽只有 +17%，FMA 约 +1%；
+GEMM 的 CPU 侧同样受限（加上 FMA 后在 33–35 GFLOP/s 间波动）。结论：
+**在本项目的 workload 上 Zig SIMD 不是瓶颈**，真正决定 CPU/GPU 对比的是内存带宽与
+`-Doptimize=ReleaseFast`（Debug → ReleaseFast 约 9 倍）。只有将来做 transcendental、
+稀疏（gather）、或 bf16/低精度 kernel 时，才会真正碰到那份批评清单里的限制。
+
 ## native WebGPU 实现
 
 ```text
 src/gpu/
   webgpu.zig        # 手写 extern C ABI；无 @cImport（native 与 wasm 共用）
-  context.zig       # instance/adapter/device/queue、ProcessEvents pump、错误域、limits、readBuffer
-  pipeline.zig      # add/saxpy：WGSL pipeline / bind group / buffer cache、dispatch、readback
-  gemm.zig          # GEMM simple/tiled：pipeline/buffer cache、canRun、CPU 参考
+  context.zig       # instance/device/queue、pump、错误域、limits；四条 kernel 共用的
+                    # createKernelPipeline / createStorageBuffer / writeBytes /
+                    # submitRecorded / readBuffer / workgroupGrid
+  pipeline.zig      # add/saxpy 的绑定与 dispatch
+  gemm.zig          # GEMM simple/tiled：绑定、dispatch、canRun、CPU 参考
   reduce.zig        # reduce sum/max：两趟归约、CPU 参考
   shaders/add.wgsl
   shaders/saxpy.wgsl

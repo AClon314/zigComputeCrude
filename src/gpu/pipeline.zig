@@ -77,56 +77,18 @@ fn ensurePipeline(self: *GpuContext, kernel: Kernel) !void {
     const cache = &self.pipelines[kernelIndex(kernel)];
     if (cache.pipeline != null) return;
 
+    // This slot owns its bind group layout; the shared pipeline helper only
+    // fills in shader module / pipeline layout / pipeline.
     var entries = layoutEntries(kernel);
-    const bind_group_layout = try self.createBindGroupLayout(&wgpu.WGPUBindGroupLayoutDescriptor{
+    cache.bind_group_layout = try self.createBindGroupLayout(&wgpu.WGPUBindGroupLayoutDescriptor{
         .nextInChain = null,
         .label = emptyStringView(),
         .entryCount = if (kernel == .add) 3 else 4,
         .entries = entries[0..].ptr,
     });
-    errdefer if (bind_group_layout) |handle| wgpu.wgpuBindGroupLayoutRelease(handle);
-
-    var bind_group_layouts = [1]wgpu.WGPUBindGroupLayout{bind_group_layout};
-    const pipeline_layout = try self.createPipelineLayout(&wgpu.WGPUPipelineLayoutDescriptor{
-        .nextInChain = null,
-        .label = emptyStringView(),
-        .bindGroupLayoutCount = 1,
-        .bindGroupLayouts = bind_group_layouts[0..].ptr,
-        .immediateSize = 0,
-    });
-    errdefer if (pipeline_layout) |handle| wgpu.wgpuPipelineLayoutRelease(handle);
 
     const shader_code = if (kernel == .add) add_shader else saxpy_shader;
-    var shader_source = wgpu.WGPUShaderSourceWGSL{
-        .chain = .{
-            .next = null,
-            .sType = wgpu.WGPUSType_ShaderSourceWGSL,
-        },
-        .code = .{ .data = shader_code.ptr, .length = shader_code.len },
-    };
-    const shader_module = try self.createShaderModule(&wgpu.WGPUShaderModuleDescriptor{
-        .nextInChain = @ptrCast(&shader_source.chain),
-        .label = emptyStringView(),
-    });
-    errdefer if (shader_module) |handle| wgpu.wgpuShaderModuleRelease(handle);
-
-    const pipeline = try self.createComputePipeline(&wgpu.WGPUComputePipelineDescriptor{
-        .nextInChain = null,
-        .label = emptyStringView(),
-        .layout = pipeline_layout,
-        .compute = .{
-            .nextInChain = null,
-            .module = shader_module,
-            .entryPoint = stringView("main"),
-            .constantCount = 0,
-            .constants = null,
-        },
-    });
-
-    cache.bind_group_layout = bind_group_layout;
-    cache.pipeline_layout = pipeline_layout;
-    cache.shader_module = shader_module;
-    cache.pipeline = pipeline;
+    try self.createKernelPipeline(cache, shader_code, "main", cache.bind_group_layout);
 }
 
 fn ensureResources(self: *GpuContext, kernel: Kernel, byte_size: usize) !void {
@@ -138,36 +100,26 @@ fn ensureResources(self: *GpuContext, kernel: Kernel, byte_size: usize) !void {
     resources.byte_size = byte_size;
     errdefer resources.deinit();
 
-    var storage_descriptor = wgpu.WGPUBufferDescriptor{
-        .nextInChain = null,
-        .label = emptyStringView(),
-        .usage = wgpu.WGPUBufferUsage_Storage | wgpu.WGPUBufferUsage_CopyDst,
-        .size = @intCast(byte_size),
-        .mappedAtCreation = 0,
-    };
     for (0..3) |i| {
-        if (i == 2) storage_descriptor.usage = wgpu.WGPUBufferUsage_Storage | wgpu.WGPUBufferUsage_CopySrc;
-        resources.storage[i] = try self.createBuffer(&storage_descriptor);
+        const usage = if (i == 2)
+            wgpu.WGPUBufferUsage_Storage | wgpu.WGPUBufferUsage_CopySrc
+        else
+            wgpu.WGPUBufferUsage_Storage | wgpu.WGPUBufferUsage_CopyDst;
+        resources.storage[i] = try self.createStorageBuffer(byte_size, usage);
     }
 
     if (kernel == .saxpy) {
-        resources.params = try self.createBuffer(&wgpu.WGPUBufferDescriptor{
-            .nextInChain = null,
-            .label = emptyStringView(),
-            .usage = wgpu.WGPUBufferUsage_Uniform | wgpu.WGPUBufferUsage_CopyDst,
-            // A one-f32 uniform struct has a 16-byte WGSL layout footprint.
-            .size = 16,
-            .mappedAtCreation = 0,
-        });
+        // A one-f32 uniform struct has a 16-byte WGSL layout footprint.
+        resources.params = try self.createStorageBuffer(
+            16,
+            wgpu.WGPUBufferUsage_Uniform | wgpu.WGPUBufferUsage_CopyDst,
+        );
     }
 
-    resources.staging = try self.createBuffer(&wgpu.WGPUBufferDescriptor{
-        .nextInChain = null,
-        .label = emptyStringView(),
-        .usage = wgpu.WGPUBufferUsage_MapRead | wgpu.WGPUBufferUsage_CopyDst,
-        .size = @intCast(byte_size),
-        .mappedAtCreation = 0,
-    });
+    resources.staging = try self.createStorageBuffer(
+        byte_size,
+        wgpu.WGPUBufferUsage_MapRead | wgpu.WGPUBufferUsage_CopyDst,
+    );
 
     var bind_entries: [4]wgpu.WGPUBindGroupEntry = undefined;
     for (&bind_entries) |*entry| entry.* = std.mem.zeroes(wgpu.WGPUBindGroupEntry);
@@ -192,16 +144,6 @@ fn ensureResources(self: *GpuContext, kernel: Kernel, byte_size: usize) !void {
         .entryCount = entry_count,
         .entries = bind_entries[0..].ptr,
     });
-}
-
-fn writeBytes(self: *GpuContext, buffer: wgpu.WGPUBuffer, bytes: []const u8) void {
-    wgpu.wgpuQueueWriteBuffer(
-        self.queue,
-        buffer,
-        0,
-        @as(?*const anyopaque, @ptrCast(bytes.ptr)),
-        bytes.len,
-    );
 }
 
 fn dispatchMany(
@@ -251,20 +193,7 @@ fn dispatchMany(
         0,
         @intCast(byte_size),
     );
-    const command_buffer = wgpu.wgpuCommandEncoderFinish(encoder, null) orelse {
-        wgpu.wgpuCommandEncoderRelease(encoder);
-        self.discardErrorScope();
-        return error.GpuError;
-    };
-    wgpu.wgpuCommandEncoderRelease(encoder);
-
-    var commands = [1]wgpu.WGPUCommandBuffer{command_buffer};
-    wgpu.wgpuQueueSubmit(self.queue, 1, commands[0..].ptr);
-    self.endErrorScope() catch |err| {
-        wgpu.wgpuCommandBufferRelease(command_buffer);
-        return err;
-    };
-    wgpu.wgpuCommandBufferRelease(command_buffer);
+    try self.submitRecorded(encoder);
     return;
 }
 
@@ -272,15 +201,8 @@ fn dispatch(self: *GpuContext, kernel: Kernel, n: usize, byte_size: usize) !void
     try dispatchMany(self, kernel, n, byte_size, 1);
 }
 
-fn readResult(self: *GpuContext, resources: *context_mod.BufferCache, out: []f32, byte_size: usize) !void {
-    try mapRead(self, resources.staging, byte_size);
-    const mapped = wgpu.wgpuBufferGetMappedRange(resources.staging, 0, byte_size) orelse {
-        wgpu.wgpuBufferUnmap(resources.staging);
-        return error.GpuError;
-    };
-    defer wgpu.wgpuBufferUnmap(resources.staging);
-    const mapped_bytes = @as([*]const u8, @ptrCast(mapped))[0..byte_size];
-    @memcpy(std.mem.sliceAsBytes(out), mapped_bytes);
+fn readResult(self: *GpuContext, resources: *context_mod.BufferCache, out: []f32) !void {
+    return self.readBuffer(resources.staging, std.mem.sliceAsBytes(out));
 }
 
 fn execute(
@@ -301,15 +223,15 @@ fn execute(
     try ensureResources(self, kernel, byte_size);
 
     const resources = &self.resources[kernelIndex(kernel)];
-    writeBytes(self, resources.storage[0], std.mem.sliceAsBytes(a));
-    writeBytes(self, resources.storage[1], std.mem.sliceAsBytes(b));
+    self.writeBytes(resources.storage[0], std.mem.sliceAsBytes(a));
+    self.writeBytes(resources.storage[1], std.mem.sliceAsBytes(b));
     if (kernel == .saxpy) {
         var alpha_value = alpha orelse return error.GpuError;
-        writeBytes(self, resources.params, std.mem.asBytes(&alpha_value));
+        self.writeBytes(resources.params, std.mem.asBytes(&alpha_value));
     }
 
     try dispatch(self, kernel, out.len, byte_size);
-    try readResult(self, resources, out, byte_size);
+    try readResult(self, resources, out);
 }
 
 pub fn addWithContext(self: *GpuContext, out: []f32, a: []const f32, b: []const f32) !void {
@@ -340,10 +262,10 @@ pub fn addBatchedWithContext(
     try ensurePipeline(self, .add);
     try ensureResources(self, .add, byte_size);
     const resources = &self.resources[kernelIndex(.add)];
-    writeBytes(self, resources.storage[0], std.mem.sliceAsBytes(a));
-    writeBytes(self, resources.storage[1], std.mem.sliceAsBytes(b));
+    self.writeBytes(resources.storage[0], std.mem.sliceAsBytes(a));
+    self.writeBytes(resources.storage[1], std.mem.sliceAsBytes(b));
     try dispatchMany(self, .add, out.len, byte_size, iters);
-    try readResult(self, resources, out, byte_size);
+    try readResult(self, resources, out);
 }
 
 /// Record a fallback from the comptime engine without exposing the context
@@ -394,24 +316,4 @@ pub fn addBatched(out: []f32, a: []const f32, b: []const f32, iters: usize) !voi
         recordFallback(@errorName(err));
         return err;
     };
-}
-
-// Kept in this module so map callback setup cannot accidentally be changed to
-// a wait-any-based implementation.  On a wait timeout the pending mapping is
-// cancelled before returning: a mapping left in `Waiting` would make the next
-// `wgpuQueueSubmit` fail with a fatal "buffer is still mapped" validation error.
-fn mapRead(self: *GpuContext, buffer: wgpu.WGPUBuffer, byte_size: usize) !void {
-    var state = context_mod.MapState{};
-    _ = wgpu.wgpuBufferMapAsync(buffer, wgpu.WGPUMapMode_Read, 0, byte_size, .{
-        .nextInChain = null,
-        .mode = wgpu.WGPUCallbackMode_AllowProcessEvents,
-        .callback = context_mod.mapCallback,
-        .userdata1 = @ptrCast(&state),
-        .userdata2 = null,
-    });
-    self.waitFor(&state) catch |err| {
-        wgpu.wgpuBufferUnmap(buffer);
-        return err;
-    };
-    if (state.status != wgpu.WGPUMapAsyncStatus_Success) return error.GpuError;
 }

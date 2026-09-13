@@ -38,28 +38,14 @@ const Params = extern struct {
     pad2: u32,
 };
 
-const PipelineSlot = struct {
-    shader_module: wgpu.WGPUShaderModule = null,
-    pipeline_layout: wgpu.WGPUPipelineLayout = null,
-    pipeline: wgpu.WGPUComputePipeline = null,
-
-    fn deinit(self: *PipelineSlot) void {
-        if (self.pipeline) |handle| wgpu.wgpuComputePipelineRelease(handle);
-        self.pipeline = null;
-        if (self.pipeline_layout) |handle| wgpu.wgpuPipelineLayoutRelease(handle);
-        self.pipeline_layout = null;
-        if (self.shader_module) |handle| wgpu.wgpuShaderModuleRelease(handle);
-        self.shader_module = null;
-    }
-};
-
 const Cache = struct {
     device: wgpu.WGPUDevice = null,
     n: usize = 0,
     buckets: usize = 0,
 
     bind_group_layout: wgpu.WGPUBindGroupLayout = null,
-    pipelines: [2]PipelineSlot = .{ .{}, .{} },
+    // sum/max share the bind group layout above.
+    pipelines: [2]context_mod.PipelineCache = .{ .{}, .{} },
 
     input: wgpu.WGPUBuffer = null,
     partials: wgpu.WGPUBuffer = null,
@@ -127,20 +113,6 @@ fn emptyStringView() wgpu.WGPUStringView {
     return .{ .data = null, .length = wgpu.WGPU_STRLEN };
 }
 
-fn stringView(comptime text: []const u8) wgpu.WGPUStringView {
-    return .{ .data = text.ptr, .length = text.len };
-}
-
-fn writeBytes(ctx: *GpuContext, buffer: wgpu.WGPUBuffer, bytes: []const u8) void {
-    wgpu.wgpuQueueWriteBuffer(
-        ctx.queue,
-        buffer,
-        0,
-        @as(?*const anyopaque, @ptrCast(bytes.ptr)),
-        bytes.len,
-    );
-}
-
 /// Number of pass-1 workgroups: one per 64 elements, capped at the device's
 /// per-dimension dispatch limit.  Each workgroup then handles several
 /// 64-element strides via the shader's grid-stride loop.
@@ -164,16 +136,6 @@ pub fn canRun(limits: context_mod.GpuLimits, n: usize) bool {
     }
     const buckets = bucketCount(limits, n);
     return buckets > 0 and buckets <= limits.maxComputeWorkgroupsPerDimension;
-}
-
-fn createStorageBuffer(ctx: *GpuContext, byte_size: usize, usage: wgpu.WGPUBufferUsage) !wgpu.WGPUBuffer {
-    return ctx.createBuffer(&wgpu.WGPUBufferDescriptor{
-        .nextInChain = null,
-        .label = emptyStringView(),
-        .usage = usage,
-        .size = @intCast(byte_size),
-        .mappedAtCreation = 0,
-    });
 }
 
 fn ensurePipelines(ctx: *GpuContext, cache: *Cache) !void {
@@ -201,40 +163,7 @@ fn ensurePipelines(ctx: *GpuContext, cache: *Cache) !void {
     inline for ([2][]const u8{ "sum_main", "max_main" }, 0..) |entry_point, index| {
         const slot = &cache.pipelines[index];
         if (slot.pipeline == null) {
-            errdefer slot.deinit();
-            var bind_group_layouts = [1]wgpu.WGPUBindGroupLayout{cache.bind_group_layout};
-            slot.pipeline_layout = try ctx.createPipelineLayout(&wgpu.WGPUPipelineLayoutDescriptor{
-                .nextInChain = null,
-                .label = emptyStringView(),
-                .bindGroupLayoutCount = bind_group_layouts.len,
-                .bindGroupLayouts = bind_group_layouts[0..].ptr,
-                .immediateSize = 0,
-            });
-
-            var shader_source = wgpu.WGPUShaderSourceWGSL{
-                .chain = .{
-                    .next = null,
-                    .sType = wgpu.WGPUSType_ShaderSourceWGSL,
-                },
-                .code = .{ .data = reduce_shader.ptr, .length = reduce_shader.len },
-            };
-            slot.shader_module = try ctx.createShaderModule(&wgpu.WGPUShaderModuleDescriptor{
-                .nextInChain = @ptrCast(&shader_source.chain),
-                .label = emptyStringView(),
-            });
-
-            slot.pipeline = try ctx.createComputePipeline(&wgpu.WGPUComputePipelineDescriptor{
-                .nextInChain = null,
-                .label = emptyStringView(),
-                .layout = slot.pipeline_layout,
-                .compute = .{
-                    .nextInChain = null,
-                    .module = slot.shader_module,
-                    .entryPoint = stringView(entry_point),
-                    .constantCount = 0,
-                    .constants = null,
-                },
-            });
+            try ctx.createKernelPipeline(slot, reduce_shader, entry_point, cache.bind_group_layout);
         }
     }
 }
@@ -248,33 +177,27 @@ fn ensureBuffers(ctx: *GpuContext, cache: *Cache, n: usize, buckets: usize) !voi
     const input_bytes = inputBytes(n) orelse return error.GpuError;
     const partial_bytes = std.math.mul(usize, buckets, @sizeOf(f32)) catch return error.GpuError;
 
-    cache.input = try createStorageBuffer(
-        ctx,
+    cache.input = try ctx.createStorageBuffer(
         input_bytes,
         wgpu.WGPUBufferUsage_Storage | wgpu.WGPUBufferUsage_CopyDst,
     );
-    cache.partials = try createStorageBuffer(
-        ctx,
+    cache.partials = try ctx.createStorageBuffer(
         partial_bytes,
         wgpu.WGPUBufferUsage_Storage,
     );
-    cache.final = try createStorageBuffer(
-        ctx,
+    cache.final = try ctx.createStorageBuffer(
         @sizeOf(f32),
         wgpu.WGPUBufferUsage_Storage | wgpu.WGPUBufferUsage_CopySrc,
     );
-    cache.staging = try createStorageBuffer(
-        ctx,
+    cache.staging = try ctx.createStorageBuffer(
         @sizeOf(f32),
         wgpu.WGPUBufferUsage_MapRead | wgpu.WGPUBufferUsage_CopyDst,
     );
-    cache.params_in = try createStorageBuffer(
-        ctx,
+    cache.params_in = try ctx.createStorageBuffer(
         @sizeOf(Params),
         wgpu.WGPUBufferUsage_Uniform | wgpu.WGPUBufferUsage_CopyDst,
     );
-    cache.params_partials = try createStorageBuffer(
-        ctx,
+    cache.params_partials = try ctx.createStorageBuffer(
         @sizeOf(Params),
         wgpu.WGPUBufferUsage_Uniform | wgpu.WGPUBufferUsage_CopyDst,
     );
@@ -339,11 +262,11 @@ fn runImpl(
     try ensurePipelines(ctx, cache);
     try ensureBuffers(ctx, cache, n, buckets);
 
-    writeBytes(ctx, cache.input, std.mem.sliceAsBytes(input));
+    ctx.writeBytes(cache.input, std.mem.sliceAsBytes(input));
     var params_in = Params{ .n = @intCast(n), .pad0 = 0, .pad1 = 0, .pad2 = 0 };
-    writeBytes(ctx, cache.params_in, std.mem.asBytes(&params_in));
+    ctx.writeBytes(cache.params_in, std.mem.asBytes(&params_in));
     var params_partials = Params{ .n = @intCast(buckets), .pad0 = 0, .pad1 = 0, .pad2 = 0 };
-    writeBytes(ctx, cache.params_partials, std.mem.asBytes(&params_partials));
+    ctx.writeBytes(cache.params_partials, std.mem.asBytes(&params_partials));
 
     const index = opIndex(op);
     ctx.beginErrorScope();
@@ -375,20 +298,7 @@ fn runImpl(
         0,
         @sizeOf(f32),
     );
-    const command_buffer = wgpu.wgpuCommandEncoderFinish(encoder, null) orelse {
-        wgpu.wgpuCommandEncoderRelease(encoder);
-        ctx.discardErrorScope();
-        return error.GpuError;
-    };
-    wgpu.wgpuCommandEncoderRelease(encoder);
-
-    var commands = [1]wgpu.WGPUCommandBuffer{command_buffer};
-    wgpu.wgpuQueueSubmit(ctx.queue, 1, commands[0..].ptr);
-    ctx.endErrorScope() catch |err| {
-        wgpu.wgpuCommandBufferRelease(command_buffer);
-        return err;
-    };
-    wgpu.wgpuCommandBufferRelease(command_buffer);
+    try ctx.submitRecorded(encoder);
 
     try ctx.readBuffer(cache.staging, std.mem.asBytes(out));
 }
@@ -456,14 +366,15 @@ pub fn referenceMax(input: []const f32) f32 {
     return acc;
 }
 
-/// 8-lane CPU reference.  The lane-wise partial sums use a different
-/// association order than the scalar reference (and than the GPU), so callers
-/// compare with a tolerance instead of bit equality.
+/// Target-width CPU reference (vectorWidth() lanes).  The lane-wise partial
+/// sums use a different association order than the scalar reference (and than
+/// the GPU), so callers compare with a tolerance instead of bit equality.
 pub fn referenceSumSimd(input: []const f32) f32 {
-    const V = @Vector(8, f32);
+    const V = @Vector(vectorWidth(), f32);
+    const width = vectorWidth();
     var lanes: V = @splat(0);
     var index: usize = 0;
-    while (index + 8 <= input.len) : (index += 8) {
+    while (index + width <= input.len) : (index += width) {
         const values: V = @as(*align(1) const V, @ptrCast(input.ptr + index)).*;
         lanes += values;
     }
@@ -473,16 +384,22 @@ pub fn referenceSumSimd(input: []const f32) f32 {
 }
 
 pub fn referenceMaxSimd(input: []const f32) f32 {
-    const V = @Vector(8, f32);
+    const V = @Vector(vectorWidth(), f32);
+    const width = vectorWidth();
     var lanes: V = @splat(-std.math.inf(f32));
     var index: usize = 0;
-    while (index + 8 <= input.len) : (index += 8) {
+    while (index + width <= input.len) : (index += width) {
         const values: V = @as(*align(1) const V, @ptrCast(input.ptr + index)).*;
         lanes = @max(lanes, values);
     }
     var total: f32 = @reduce(.Max, lanes);
     while (index < input.len) : (index += 1) total = @max(total, input[index]);
     return total;
+}
+
+/// Target-dependent vector width (AVX2 = 8 f32, AVX-512 = 16, NEON = 4, …).
+fn vectorWidth() comptime_int {
+    return std.simd.suggestVectorLength(f32) orelse 4;
 }
 
 // ---- tests ----

@@ -48,15 +48,22 @@ pub fn ComputeEngine(comptime bt: BackendType) type {
 
 // ---- 内核实现（可放在文件底部，为 file-private fn）----
 
+/// 目标相关的最优向量宽度（AVX2=8、AVX-512=16、NEON=4、wasm simd128=4…）。
+/// 不用写死 8：写死会在非 AVX2 平台上浪费（或拆寄存器）。
+fn vectorWidth(comptime T: type) comptime_int {
+    return std.simd.suggestVectorLength(T) orelse 4;
+}
+
 fn addScalar(comptime T: type, out: []T, a: []const T, b: []const T) void {
     for (0..a.len) |i| out[i] = a[i] + b[i];
 }
 
 fn addSimd(comptime T: type, out: []T, a: []const T, b: []const T) void {
-    const V = @Vector(8, T);
+    const width = vectorWidth(T);
+    const V = @Vector(width, T);
     var i: usize = 0;
-    const chunks = a.len / 8;
-    while (i < chunks * 8) : (i += 8) {
+    const chunks = a.len / width;
+    while (i < chunks * width) : (i += width) {
         const va: V = @as(*align(1) const V, @ptrCast(a.ptr + i)).*;
         const vb: V = @as(*align(1) const V, @ptrCast(b.ptr + i)).*;
         const vr: V = va + vb;
@@ -70,14 +77,17 @@ fn saxpyScalar(comptime T: type, alpha: T, out: []T, x: []const T, y: []const T)
 }
 
 fn saxpySimd(comptime T: type, alpha: T, out: []T, x: []const T, y: []const T) void {
-    const V = @Vector(8, T);
+    const width = vectorWidth(T);
+    const V = @Vector(width, T);
     const va: V = @splat(alpha);
     var i: usize = 0;
-    const chunks = x.len / 8;
-    while (i < chunks * 8) : (i += 8) {
+    const chunks = x.len / width;
+    while (i < chunks * width) : (i += width) {
         const vx: V = @as(*align(1) const V, @ptrCast(x.ptr + i)).*;
         const vy: V = @as(*align(1) const V, @ptrCast(y.ptr + i)).*;
-        const vr: V = va * vx + vy;
+        // @mulAdd 而不是 vx * va + vy：Zig 默认严格浮点不会把 mul+add 收缩成 FMA，
+        // 显式 @mulAdd 才能让 x86 生成 vfmadd（对 saxpy/GEMM 是实打实的减半算术指令）。
+        const vr: V = @mulAdd(V, va, vx, vy);
         @as(*align(1) V, @ptrCast(out.ptr + i)).* = vr;
     }
     while (i < x.len) : (i += 1) out[i] = alpha * x[i] + y[i];
