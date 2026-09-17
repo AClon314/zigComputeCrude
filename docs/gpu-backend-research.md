@@ -41,3 +41,32 @@
 5. 与 Zig `ComputeEngine` 架构落地的建议 + 理由
 6. 风险 / 需实测验证点
 保持精炼，中文输出。
+
+---
+
+## 回填（2026-09-17）：待验证项 3 已实测结项
+
+**问题 3「Zig 0.16 `std.gpu` 是不是 WebGPU 绑定」→ 不是。**
+
+本机 Zig 0.16.0 实测 `lib/zig/std/gpu.zig`（104 行，`std.gpu` 下只有这一个文件）：
+
+- 内容是 `global_invocation_id` / `local_invocation_id` / `workgroup_id` / `num_workgroups` /
+  `invocation_id` / `frag_coord` / `frag_depth` 等 **shader 内置量**（`addrspace(.input/.output)`
+  extern），以及 `ExecutionMode` + `executionMode()`；`executionMode` 内部断言
+  `cc == .spirv_kernel`（`local_size`）/ `.spirv_fragment`，走 `OpExecutionMode` inline asm。
+- 即：**它是"用 Zig 写 shader"的 SPIR-V 侧 intrinsic 层**，用来替代 WGSL 的语法位置；
+- **没有任何 host 侧 API**：无 device / queue / adapter / pipeline / bind group / buffer /
+  mapping / submit / readback。对 compute 的支持 = **0**（不提供 compute pipeline 与 dispatch）。
+
+因此，与 mach-gpu / wgpu-native 不存在"谁更省事"的可比性：
+
+| 维度 | `std.gpu` | wgpu-native + emdawnwebgpu（本项目现状） |
+|---|---|---|
+| 层 | shader 语言层（SPIR-V） | host 绑定层（C ABI） |
+| host API（buffer/pipeline/dispatch） | 无 | 有（手写 31 符号子集） |
+| 浏览器 WebGPU | ❌（浏览器只收 WGSL） | ✅（emdawnwebgpu 同形 ABI） |
+| 与 CPU 参考对拍 | 需自建，且目标只有 native | 已有，同一定义双后端 |
+
+**结论**：不引入。它和 `naga / Tint`（shader 翻译）同类，只有"放弃浏览器"时才进入候选；
+详见 `docs/node-system-migration.md` §5.6（那里也给出了 awesome-zig GPU 一节的逐条调研，
+结论是没有任何现成项目覆盖本项目"一绑定两目标 + 对拍 + 常驻 Chain + 自研原语"的组合）。

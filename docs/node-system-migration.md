@@ -182,7 +182,8 @@
     体积与构建复杂度高；可作为未来的"行为对齐"验证后端，不建议现在换；
   - **直连 Vulkan/Metal/DX12**：需要自己维护资源管理 + shader 翻译（naga/SPIRV-Cross/Tint），
     且浏览器那份还是要 WGSL——等于多维护一套，收益只有"少一层 ABI"；
-  - **Zig → SPIR-V**（Zig 自带 SPIR-V 后端）：native-only，实验性，且本项目硬性禁用 SPIR-V
+  - **Zig → SPIR-V**（Zig 自带 SPIR-V 后端，其 shader 侧 intrinsic 就是 `std.gpu`，见 §5.6）：
+    native-only，实验性，且本项目硬性禁用 SPIR-V
     （浏览器拒收），会破坏"一绑定两目标"这个核心资产。
 - 可做的优化：把 wgpu-native 改成**运行期 dlopen**（构建解耦、可选后端），并在绑定层预留
   texture / indirect 等符号的扩展位（扩展时必须同步扩 ABI 检查清单）。
@@ -214,6 +215,8 @@
 | 图调度 / 融合 | Halide（图像 DSL，CPU/CUDA/OpenCL/Metal；**无 WebGPU**）、TVM/MLIR | 不可直接用；**借鉴其 schedule 思想**（fuse/tile/vectorize）设计自研 IR |
 | 着色器翻译（未来非浏览器路径） | naga / SPIRV-Cross / Tint | 只有放弃浏览器时才值得引入 |
 | 图形/游戏框架 | `zig-gamedev`（zgpu/zmath/zmesh，Dawn 系）、`mach` | 图形向、依赖重、版本churn 大；不解决 compute 原语，不建议引入 |
+| GPU 绑定（wgpu-native 的 Zig 侧） | `raugl/wgpu-zig`、`xiexingwu/wgpu-zig` 等（0~1★，2025~2026） | **仅作参考**：桌面-only（无 `wasm32-emscripten` 目标）、纯绑定无 runtime/对拍；只有放弃浏览器时才评估（§5.6） |
+| Zig `std.gpu`（0.16 起自带） | Zig 官方 std | **不进基线**：SPIR-V 侧 intrinsic（`.spirv_kernel` cc），非 host 绑定、不产出 WGSL → native-only（§5.6） |
 
 直白说：**"原语层"是这个项目的自研职责，也是它存在的意义**；能外包的只有
 CPU 参考实现、编解码、色彩、去噪这些"领域 C/C++ 库"，以及未来的 shader 翻译。
@@ -227,7 +230,37 @@ CPU 参考实现、编解码、色彩、去噪这些"领域 C/C++ 库"，以及�
 | emdawnwebgpu（browser） | **保留** | 唯一现实的"浏览器 + 同形 C ABI";约束写进 IR 基线 |
 | 原语/运行时（scan/sort/BVH/texture…） | **自研** | 无可移植的现成库 |
 | CPU 领域库（OIIO/OCIO/OIDN/FastNoise2/zignal/zigimg） | **按需接入** | 强在 CPU 侧，接口是 C ABI |
-| Halide / naga / Dawn(native) / SPIR-V | **攒着** | 只有放弃浏览器或要"行为对齐"时才引入 |
+| Halide / naga / Dawn(native) / SPIR-V / `std.gpu` | **攒着** | 只有放弃浏览器或要"行为对齐"时才引入（§5.6） |
+| 桌面 wgpu 绑定（wgpu-zig 系） | **仅参考** | 无浏览器目标、无 runtime；放弃浏览器时才评估（§5.6） |
+
+### 5.6 生态调研回填（2026-09-17，awesome-zig）
+
+依据 `zigcc/awesome-zig` 的 README（`main` 分支，2026-09-17 抓取；`### GPU Computing` 一节
+共 10 条）逐条核对，并用 GitHub API 实查活跃度。**结论：没有覆盖本项目核心组合的现成项目，
+§5.4 的"原语层必须自研"成立。** 核心组合 = ① 一份 C ABI 同编 native + 浏览器
+② CPU 参考逐元素对拍当契约 ③ 常驻 `Chain` runtime ④ 自研原语/spatial。
+
+| 分类 | 代表 | 为什么不够 |
+|---|---|---|
+| CUDA wrapper | `gwenzek/cudaz`、`akhildevelops/cudaz`、`lennyerik/cutransform` | NVIDIA-only；另一套 kernel 语言，与"WGSL 单一定义"相反 |
+| Vulkan | `Snektron/vulkan-zig`（912★，活跃）、`e253/zig-ocl` | 纯绑定 / ICD loader，无 compute 运行时；SPIR-V 路线浏览器拒收 |
+| 图形引擎 / demo | `MASS4/MEGA4/GPU`（SDL3 GPU）、`ckrowland/simulations`、`Avokadoen/zig_vulkan` | 图形向，不提供 compute 原语 |
+| **WebGPU（历史）** | `hexops/mach-gpu`、`mach-gpu-dawn`、`mach-sysgpu` | **已整体迁入 `hexops-graveyard`，最后 push 2024-07-08**；Dawn(native) 路线、图形向 |
+| 桌面 wgpu 绑定 | `raugl/wgpu-zig`、`xiexingwu/wgpu-zig`（0~1★） | 目标列表只有 desktop/mobile（无 `wasm32-emscripten`），且无 runtime/对拍 |
+| ML / tensor | `zml`（4057★）、`ZEIN`、`ggml-zig`、`zten`、`Zigrad` | 领域库：图固定为 tensor op，宿主是 MLIR/XLA/PJRT 或纯 CPU，不能换后端对拍 |
+
+另外查了 Zig 侧的 `spatial hash grid` / `BVH` / `gpu radix sort` / `prefix sum scan`：**零结果**，
+S1 的均匀网格与 scan/compaction 确实没有先例。两个可执行结论：
+
+1. **`std.gpu` 不是竞品，也不该进基线**（结掉 `docs/gpu-backend-research.md` 的待验证项 3）：
+   实测 Zig 0.16 的 `lib/zig/std/gpu.zig` 共 104 行，内容只有 `global_invocation_id` /
+   `workgroup_id` / `executionMode` 等 **SPIR-V 侧 intrinsic**（`executionMode` 内部断言
+   `cc == .spirv_kernel`），**没有任何 host 侧 API**（device/queue/pipeline/buffer/mapping）。
+   它不能替代 wgpu-native / emdawnwebgpu 绑定；且它是 native SPIR-V 路线，浏览器 WebGPU
+   只吃 WGSL → 会破坏"一绑定两目标"。归类与 `naga / Tint` 相同：放弃浏览器时才考虑。
+2. **`mach-gpu` 的停摆既是反面教材也是支撑**：三个 WebGPU 项目一起进 graveyard，说明这个
+   方向"看着有人做过、实际都停摆"，死因是图形向依赖 churn + Dawn 跨编译维护成本；本项目用
+   "预编译 wgpu-native + emdawnwebgpu + 只碰 31 符号手写子集 + `check_abi_drift.sh`"规避了它。
 
 ---
 
