@@ -245,7 +245,10 @@ host 运行时（Buffer/Kernel/Chain）、对拍契约、以及 spatial 这类�
    消融；回填 README 的 dGPU 数字（含"链式优势 2.69x vs 1.34x"这一条）。~~ **已完成**（2026-09-19）：
    `--adapter` + `probe().adapter_info` + 每偏好一个 context + README「adapter 消融」表；
    ABI 检查同时扩到「struct 字段清单 + 硬编码常量值」（`check_abi_drift.sh`）。
-2. **（做）确定性分级门禁**：把整数/索引类断言从"容差"改为"精确相等"，写入 §7.1 与测试。
+2. ~~**（做）确定性分级门禁**~~ **已完成**（2026-09-19）：`src/determinism.zig`
+   （`Class = discrete/scalar/accumulated` × `Precision = exact/tolerant/fast`，comptime 零开销），
+   gemm/reduce/chain_bench/main 全部改走判据表，CLI 加 `--precision`；
+   实测 `--precision exact` 下 f32 累加链 MISMATCH（rel 3.70e-6）而离散路径全绿。
 3. **（写）把本文件作为"新前端准入条件"的依据**，链到 `node-system-migration.md` §5.6 / §7.1。
 4. **（可选）给 Zig 上游报告两个崩溃**（都是最小复现，5 行以内）：
    - `@workGroupId(0) * @workGroupSize(0)` 在 `amdgcn-amdhsa-none` 上 panic；

@@ -140,7 +140,9 @@ fn printUsage(writer: *Io.Writer) !void {
             "       computeAccel --kernel spatial [--points <n>] [--queries <n>] [--radius <r>] [--iters <n>]\n" ++
             "   --kernel add is the default; --backend/--auto/--heuristic only apply to it.\n" ++
             "   --adapter auto|high-perf|low-power selects the WebGPU adapter (init-time switch);\n" ++
-            "   the default (auto) is WebGPU's own default, which is *not* necessarily the fastest GPU.\n",
+            "   the default (auto) is WebGPU's own default, which is *not* necessarily the fastest GPU.\n" ++
+            "   --precision exact|tolerant|fast selects the 对拍 judgement (comptime table, see src/determinism.zig);\n" ++
+            "   discrete values (indices/counts/max) stay bit-exact in every mode.\n",
         .{},
     );
 }
@@ -153,6 +155,47 @@ fn parseAdapterPreference(text: []const u8) ?computeAccel.AdapterPreference {
     }
     if (std.mem.eql(u8, text, "low-power")) return .low_power;
     return null;
+}
+
+/// `--precision`: 判据档位（exact = 位/值精确；tolerant = 默认；fast = f32 放宽）。
+fn parsePrecision(text: []const u8) ?computeAccel.determinism.Precision {
+    if (std.mem.eql(u8, text, "exact")) return .exact;
+    if (std.mem.eql(u8, text, "tolerant")) return .tolerant;
+    if (std.mem.eql(u8, text, "fast")) return .fast;
+    return null;
+}
+
+/// 判据表按 comptime 实例化：`--precision` 在 demo 层做**一次**三路派发，
+/// 比较循环里没有分支（这也是选 comptime 而不是运行期开关的原因）。
+fn toleranceFor(
+    precision: computeAccel.determinism.Precision,
+    comptime class: computeAccel.determinism.Class,
+) computeAccel.determinism.Tolerance {
+    return switch (precision) {
+        .exact => computeAccel.determinism.tolerance(.exact, class),
+        .tolerant => computeAccel.determinism.tolerance(.tolerant, class),
+        .fast => computeAccel.determinism.tolerance(.fast, class),
+    };
+}
+
+/// 把当前档位与它在该类上的判据打印出来，避免"看起来 OK"没有量级。
+fn printPrecision(
+    writer: *Io.Writer,
+    precision: computeAccel.determinism.Precision,
+    comptime class: computeAccel.determinism.Class,
+) !void {
+    const tol = toleranceFor(precision, class);
+    if (tol.isExact()) {
+        try writer.print(
+            "precision    {s} [{s}: 精确相等，0 容差]\n",
+            .{ precision.name(), class.name() },
+        );
+    } else {
+        try writer.print(
+            "precision    {s} [{s}: |diff| <= max({e:.0}, {e:.0} * |expected|)]\n",
+            .{ precision.name(), class.name(), tol.absolute, tol.relative },
+        );
+    }
 }
 
 /// One line showing which adapter the process actually opened.  Printed next to
@@ -218,6 +261,7 @@ pub fn main(init: std.process.Init) !void {
     var query_count: usize = default_spatial_queries;
     var radius: f32 = default_spatial_radius;
     var adapter_preference: computeAccel.AdapterPreference = .auto;
+    var precision: computeAccel.determinism.Precision = .tolerant;
 
     var i: usize = 1;
     while (i < args.len) {
@@ -284,6 +328,15 @@ pub fn main(init: std.process.Init) !void {
                 return;
             };
             i += 2;
+        } else if (std.mem.eql(u8, arg, "--precision")) {
+            if (!try requireValue(stdout_writer, args, i, "--precision")) return;
+            precision = parsePrecision(args[i + 1]) orelse {
+                try stdout_writer.print("error: unknown precision '{s}' (expected exact|tolerant|fast)\n", .{args[i + 1]});
+                try printUsage(stdout_writer);
+                try stdout_writer.flush();
+                return;
+            };
+            i += 2;
         } else if (std.mem.eql(u8, arg, "--points")) {
             if (!try requireValue(stdout_writer, args, i, "--points")) return;
             point_count = try std.fmt.parseInt(usize, args[i + 1], 10);
@@ -345,10 +398,10 @@ pub fn main(init: std.process.Init) !void {
 
     switch (kernel) {
         .add => try runAddDemo(stdout_writer, arena, mode, manual_backend, size, iters),
-        .gemm => try runGemmDemo(stdout_writer, arena, m, k, n, iters, variant_choice),
-        .reduce => try runReduceDemo(stdout_writer, arena, size, iters, reduce_op),
-        .chain => try runChainDemo(stdout_writer, arena, chain_kind, chain_lens, size, m, k, n, iters),
-        .spatial => try runSpatialDemo(stdout_writer, arena, point_count, query_count, radius, iters),
+        .gemm => try runGemmDemo(stdout_writer, arena, m, k, n, iters, variant_choice, precision),
+        .reduce => try runReduceDemo(stdout_writer, arena, size, iters, reduce_op, precision),
+        .chain => try runChainDemo(stdout_writer, arena, chain_kind, chain_lens, size, m, k, n, iters, precision),
+        .spatial => try runSpatialDemo(stdout_writer, arena, point_count, query_count, radius, iters, precision),
     }
 
     try stdout_writer.flush();
@@ -551,6 +604,7 @@ fn runGemmDemo(
     n: usize,
     iters: usize,
     variant_choice: VariantChoice,
+    precision: computeAccel.determinism.Precision,
 ) !void {
     if (m == 0 or k == 0 or n == 0) {
         try writer.print("error: GEMM dimensions must be non-zero\n", .{});
@@ -611,6 +665,7 @@ fn runGemmDemo(
         return;
     }
     try printAdapter(writer, probe);
+    try printPrecision(writer, precision, .accumulated);
 
     const variants: []const computeAccel.gemm.Variant = switch (variant_choice) {
         .simple => &.{.simple},
@@ -636,9 +691,10 @@ fn runGemmDemo(
             );
             continue;
         };
-        const tolerance = @max(1.0, maxAbsValue(reference)) * 1e-4;
+        const tolerance = toleranceFor(precision, .accumulated);
+        const scale = maxAbsValue(reference);
         const diff = computeAccel.gemm.maxAbsDiff(reference, work);
-        const verdict = if (diff <= tolerance) "OK" else "MISMATCH";
+        const verdict = if (tolerance.within(diff, scale)) "OK" else "MISMATCH";
         verified_any = true;
 
         const gpu_ns = computeAccel.bench.timeGemm(variant, m, k, n, a, b, work, iters) catch |err| {
@@ -661,7 +717,7 @@ fn runGemmDemo(
             "  end-to-end max|diff|={e:.3} (tol {e:.1}) {s}; speedup vs cpu_simd = {d:.2}x\n",
             .{
                 diff,
-                tolerance,
+                tolerance.limit(scale),
                 verdict,
                 if (simd_ns == 0) 0.0 else @as(f64, @floatFromInt(simd_ns)) / @as(f64, @floatFromInt(gpu_ns)),
             },
@@ -714,6 +770,7 @@ fn runReduceDemo(
     size: usize,
     iters: usize,
     op: computeAccel.reduce.Op,
+    precision: computeAccel.determinism.Precision,
 ) !void {
     if (size == 0) {
         try writer.print("error: reduce size must be non-zero\n", .{});
@@ -755,6 +812,9 @@ fn runReduceDemo(
         return;
     }
     try printAdapter(writer, probe);
+    switch (op) {
+        inline else => |o| try printPrecision(writer, precision, if (o == .sum) .accumulated else .discrete),
+    }
     if (!computeAccel.reduce.canRun(probe.limits, size)) {
         try writer.print("gpu_webgpu: 超出设备 limits（input buffer / dispatch grid），跳过\n", .{});
         return;
@@ -772,11 +832,14 @@ fn runReduceDemo(
         .max => computeAccel.reduce.referenceMax(input),
     };
     const diff = @abs(cpu_reference - gpu_value);
+    const scale = @abs(cpu_reference);
+    // 离散类（max，无舍入）在任何 precision 档下都要求精确相等；sum 是累加类。
+    // `inline else` 让每个分支里的 class 都是 comptime 常量（比较循环里没有分支）。
     const tolerance = switch (op) {
-        .sum => @max(1.0, @abs(cpu_reference)) * 1e-4,
-        .max => 0.0,
+        inline else => |o| toleranceFor(precision, if (o == .sum) .accumulated else .discrete),
     };
-    const verdict = if (diff <= tolerance) "OK" else "MISMATCH";
+    const tolerance_printed = tolerance.limit(scale);
+    const verdict = if (tolerance.within(diff, scale)) "OK" else "MISMATCH";
 
     const gpu_ns = computeAccel.bench.timeReduce(op, &gpu_value, input, iters) catch |err| {
         try writer.print(
@@ -790,12 +853,13 @@ fn runReduceDemo(
         .{ gpu_ns, bytesPerNsGbps(total_bytes, gpu_ns) },
     );
     try writer.print(
-        "  {s}: cpu_simd={d:.6} gpu={d:.6} |diff|={e:.3} {s}; speedup vs cpu_simd = {d:.2}x\n",
+        "  {s}: cpu_simd={d:.6} gpu={d:.6} |diff|={e:.3} (tol {e:.1}) {s}; speedup vs cpu_simd = {d:.2}x\n",
         .{
             op.name(),
             cpu_reference,
             gpu_value,
             diff,
+            tolerance_printed,
             verdict,
             if (simd_ns == 0) 0.0 else @as(f64, @floatFromInt(simd_ns)) / @as(f64, @floatFromInt(gpu_ns)),
         },
@@ -856,6 +920,7 @@ fn runChainDemo(
     k: usize,
     n: usize,
     repeats: usize,
+    precision: computeAccel.determinism.Precision,
 ) !void {
     var lens_buffer: [8]usize = undefined;
     const lens = parseLens(&lens_buffer, lens_text) catch {
@@ -870,6 +935,7 @@ fn runChainDemo(
         return;
     }
     try printAdapter(writer, probe);
+    try printPrecision(writer, precision, .accumulated);
     const ctx = computeAccel.runtime.open() catch |err| {
         try writer.print("chain demo: 打开设备失败（{s}）\n", .{computeAccel.gpu.lastFallbackReason() orelse @errorName(err)});
         return;
@@ -877,7 +943,7 @@ fn runChainDemo(
 
     switch (kind) {
         .saxpy => try runSaxpyChainDemo(writer, allocator, ctx, lens, size, samples),
-        .pipeline => try runPipelineChainDemo(writer, allocator, ctx, lens, m, k, n, samples),
+        .pipeline => try runPipelineChainDemo(writer, allocator, ctx, lens, m, k, n, samples, precision),
     }
 }
 
@@ -990,6 +1056,7 @@ fn runPipelineChainDemo(
     k: usize,
     n: usize,
     samples: usize,
+    precision: computeAccel.determinism.Precision,
 ) !void {
     const a = try allocator.alloc(f32, m * k);
     defer allocator.free(a);
@@ -1074,9 +1141,12 @@ fn runPipelineChainDemo(
         const submit_cut = @as(f64, @floatFromInt(staged_ns)) / @as(f64, @floatFromInt(chained_ns));
         const chained_gflops = (flops * @as(f64, @floatFromInt(repetitions))) /
             @as(f64, @floatFromInt(chained_ns));
-        // A sum over m*n terms is compared with a relative tolerance: the
-        // remaining difference is only the f32 accumulation order.
-        const verify = if (relative_diff <= 1e-4) "OK" else "MISMATCH";
+        // A sum over m*n terms is compared with the accumulation tolerance:
+        // the remaining difference is only the f32 accumulation order.
+        const verify = if (toleranceFor(precision, .accumulated).within(
+            @max(staged_diff, chained_diff),
+            @abs(reference),
+        )) "OK" else "MISMATCH";
 
         _ = stages;
         try writer.print(
@@ -1108,6 +1178,7 @@ fn runSpatialDemo(
     query_count: usize,
     radius: f32,
     repeats: usize,
+    precision: computeAccel.determinism.Precision,
 ) !void {
     if (point_count == 0 or query_count == 0 or radius < 0) {
         try writer.print("error: --points/--queries must be positive and --radius >= 0\n", .{});
@@ -1217,6 +1288,8 @@ fn runSpatialDemo(
         return;
     }
     try printAdapter(writer, probe);
+    // 索引/计数属离散类：任何 precision 档下都精确比较（不因 --precision fast 放松）。
+    try printPrecision(writer, precision, .discrete);
     const ctx = computeAccel.runtime.open() catch |err| {
         try writer.print("gpu_webgpu: 打开设备失败（{s}）\n", .{computeAccel.gpu.lastFallbackReason() orelse @errorName(err)});
         return;
@@ -1364,5 +1437,28 @@ fn runSpatialDemo(
     try writer.print(
         "neighbor lists (K={}): verified {}/{} queries as sorted sets ({s}); truncated queries skipped\n",
         .{ max_neighbors, neighbors_checked, query_count, if (neighbors_ok) "MATCH" else "MISMATCH" },
+    );
+}
+
+test "CLI parses --adapter and --precision values" {
+    const expect = std.testing.expect;
+
+    try expect(parseAdapterPreference("auto").? == .auto);
+    try expect(parseAdapterPreference("high-perf").? == .high_performance);
+    try expect(parseAdapterPreference("high-performance").? == .high_performance);
+    try expect(parseAdapterPreference("low-power").? == .low_power);
+    try expect(parseAdapterPreference("nope") == null);
+
+    try expect(parsePrecision("exact").? == .exact);
+    try expect(parsePrecision("tolerant").? == .tolerant);
+    try expect(parsePrecision("fast").? == .fast);
+    try expect(parsePrecision("nope") == null);
+
+    // 档位表按 comptime 实例化：同一 (类, 档) 组合必须给出同一份判据。
+    try expect(toleranceFor(.tolerant, .accumulated).isExact() == false);
+    try expect(toleranceFor(.exact, .accumulated).isExact());
+    try expect(toleranceFor(.fast, .discrete).isExact());
+    try expect(
+        toleranceFor(.fast, .accumulated).limit(1.0) > toleranceFor(.tolerant, .accumulated).limit(1.0),
     );
 }

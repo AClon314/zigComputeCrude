@@ -306,7 +306,7 @@ src/
     elementwise.zig gemm.zig reduce.zig scan.zig sort.zig
     image/{tile,conv,pyramid}.zig      # 领域无关
     spatial/{bvh,hash,proximity}.zig   # 按需（S1）：只在有具体消费方时新增
-  determinism.zig           # exact/tolerant/fast + 每算子容差表
+  determinism.zig           # ✅ 已落地：Class(discrete/scalar/accumulated) × Precision(exact/tolerant/fast)
   selection.zig             # 现 backend.zig + bench.zig（保留为回归/自检工具）
 docs/ tools/                # 保持
 ```
@@ -437,10 +437,14 @@ GEMM→bias→reduce 异质链，结果与 CPU 参考对拍。`backends/`、`pri
   在 WGSL 上**无法**跨厂商做到 bit 一致，容差契约是必需的，而不是可以放松的；
 - 对策：定义三档模式 `exact`（同后端可复现）/**`tolerant`（默认，逐算子容差表）**/`fast`；
   对"会改变控制流"的计算（散射采样、哈希、排序键）强制用整数/哈希运算，保证跨后端一致；
-- **门禁分级（建议立刻收紧）**：整数/索引类（scan 的偏移、compaction 的索引、均匀网格
-  cell/桶下标、k=16 邻接表）用**精确相等（`== 0`）**比，不给容差；只有 f32 流式/累加类
-  用相对容差（现有 1e-4）。整数 `atomicAdd` 的计数/槽位分配是顺序无关的，所以网格构建
-  天然落在精确档，应当写成断言而不是"看起来对"；
+- **门禁分级（已落地：`src/determinism.zig`）**：整数/索引类（scan 的偏移、compaction 的
+  索引、均匀网格 cell/桶下标、k=16 邻接表）用**精确相等**比，不给容差；只有 f32 流式/累加类
+  用相对容差（1e-4）。整数 `atomicAdd` 的计数/槽位分配是顺序无关的，所以网格构建
+  天然落在精确档。实现形态：`Class = discrete | scalar | accumulated` 的判据表 +
+  `Precision = exact | tolerant | fast`（**comptime 参数**，零运行时分支；
+  CLI `--precision` 在 demo 层做一次三路派发）；`discrete` 在任何档位下都不放松。
+  实测：`--precision exact` 下 f32 累加链（GEMM→bias→reduce）如预期 MISMATCH（rel 3.70e-6），
+  而整数/索引路径仍 OK —— 这就是"科学计算要精确、游戏要快"的实际分界；
 - 测试基建：把现有"CPU 参考 + `max|diff|`"扩成"同一 IR 跑所有后端对拍"。
 
 ### 7.2 外部库与语义覆盖

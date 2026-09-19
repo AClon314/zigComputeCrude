@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const backend = @import("backend.zig");
+const determinism_mod = @import("determinism.zig");
 const buffer = @import("buffer.zig");
 const engine = @import("engine.zig");
 const bench_mod = @import("bench.zig");
@@ -12,6 +13,7 @@ const primitives_mod = @import("primitives.zig");
 const chain_bench_mod = @import("chain_bench.zig");
 const gpu_reduce = @import("gpu/reduce.zig");
 
+pub const determinism = determinism_mod;
 pub const BackendType = backend.BackendType;
 pub const SelectionMode = backend.SelectionMode;
 pub const DeviceBuffer = buffer.DeviceBuffer;
@@ -61,6 +63,7 @@ pub fn selectBackend(
 // root.zig 中：下面的子文件被引用，它们的 test 块才被 zig build test 纳入。
 test {
     _ = backend;
+    _ = determinism_mod;
     _ = buffer;
     _ = engine;
     _ = bench_mod;

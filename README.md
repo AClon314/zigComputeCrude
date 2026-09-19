@@ -185,10 +185,19 @@ zig build run -- --kernel chain --chain pipeline --m 512 --k 512 --n 512 --chain
 zig build run -- --kernel gemm --m 1024 --k 1024 --n 1024 --adapter high-perf
 zig build run -- --kernel chain --chain pipeline --chain-lens 64 --iters 10 --adapter auto
 zig build run -- --kernel reduce --size 16777216 --adapter low-power
+
+# 对拍判据档位（exact 会让 f32 累加类如预期 MISMATCH，这是设计而非回归）
+zig build run -- --kernel chain --chain pipeline --chain-lens 16 --precision exact
+zig build run -- --kernel reduce --size 16777216 --op sum --precision fast
 ```
 
 `--kernel chain --chain pipeline` 跑的是 **GEMM → bias → reduce** 四段异质链
 （三种不同内核、两种输出形状），用于验证多内核依赖顺序与"一次提交"。
+
+`--precision exact|tolerant|fast` 选**对拍判据**（表在 `src/determinism.zig`）：离散量
+（索引/计数/max）在任何档位下都精确相等，f32 单次舍入 / 累加类按档给量级。
+判据在计时区**之外**，所以档位不影响测得的 kernel 时间（实测三档 gemm 512³ 为
+202.8 / 202.6 / 203.5 GFLOP/s，属噪声）——"游戏要快"的收益来自 adapter 与链式，不是放宽判据。
 
 `--adapter auto|high-perf|low-power` 是 **init-time** 开关，必须早于任何 GPU 调用；
 每个偏好各自缓存一个 context（可以同一进程里跑两种 adapter 对比，见下面消融）。
@@ -225,6 +234,25 @@ zig build run -- --kernel reduce --size 16777216 --adapter low-power
 
 结论：**链式（M0）的价值在独显上更大**（每次 submit+readback 往返更贵：iGPU 1.34x vs dGPU 2.69x），
 而在共享内存 iGPU 上测出的数字会低估它。所有对拍不变（GEMM `max|diff| = 0`，chain `rel 3.70e-6`）。
+
+### 判据分档（`--precision`，ReleaseFast；判据不参与计时）
+
+| 负载 | class | `exact` | `tolerant`（默认） | `fast` |
+|---|---|---|---|---|
+| chain pipeline（GEMM→bias→reduce，16 reps） | accumulated | **MISMATCH**（rel 3.70e-6，abs 2.8e2 / sum 7.57e7） | OK | OK |
+| reduce sum（f32 累加） | accumulated | OK（该 shape 实测 `|diff| = 0`） | OK | OK |
+| reduce max（无舍入） | discrete | OK（0 容差） | OK | OK |
+| GEMM 512³ tiled（tolerance 打印值） | accumulated | tol 0 | tol 7.5e-2 | tol 7.5 |
+| 同上耗时（GFLOP/s） | — | 202.6 | 202.8 | 203.5 |
+
+两个要点：
+
+1. **exact 档在 f32 累加上"故意"不过**：GEMM→bias→reduce 的最终标量与 CPU 参考差
+   `rel 3.70e-6`（纯累加顺序；WGSL §15.7.5 明确允许实现重结合/融合，所以跨厂商 bit 一致
+   不可得）。exact 档的价值就在于此：它把"这里对不上是真 bug"与"浮点顺序差"分开，
+   索引/计数/max 走 exact 永远绿灯。
+2. **档位不影响性能**：判据在计时区之外，三档 gemm 512³ 为 202.8/202.6/203.5 GFLOP/s（噪声级）。
+   "游戏要快"该动的是 adapter 与链式（见下），不是判据。
 
 ### M0 消融：saxpy 链（16 MiB/buffer，超过 L3；GB/s 计 3 条流：读 x、读 y、写 x）
 

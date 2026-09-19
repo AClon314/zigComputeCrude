@@ -13,6 +13,7 @@
 //! entry points keep the historical per-call behaviour.
 
 const std = @import("std");
+const determinism = @import("../determinism.zig");
 const runtime = @import("../runtime.zig");
 const context_mod = @import("context.zig");
 const GpuContext = context_mod.GpuContext;
@@ -433,9 +434,14 @@ test "reduce cpu scalar and simd references agree on edge sizes" {
         const input = try gpa.alloc(f32, n);
         defer gpa.free(input);
         fillDeterministic(input, n);
-        const sum_tolerance = @max(1.0, @abs(referenceSum(input))) * 1e-5;
-        try std.testing.expect(@abs(referenceSum(input) - referenceSumSimd(input)) <= sum_tolerance);
-        try std.testing.expectEqual(referenceMax(input), referenceMaxSimd(input));
+        // 同后端家族（只差累加顺序）：既有 1e-5 判据，不放松。
+        try determinism.expectScalarWithin(
+            .{ .absolute = 1e-5, .relative = 1e-5 },
+            referenceSum(input),
+            referenceSumSimd(input),
+        );
+        // max 不做任何舍入 → 任何精度档下都精确比较。
+        try determinism.expectScalar(.tolerant, .discrete, referenceMax(input), referenceMaxSimd(input));
     }
 }
 
@@ -457,12 +463,11 @@ test "reduce gpu sum and max match the cpu references" {
         var gpu_sum: f32 = 0;
         try runWithContext(&context, .sum, &gpu_sum, input);
         const cpu_sum = referenceSum(input);
-        const sum_tolerance = @max(1.0, @abs(cpu_sum)) * 1e-4;
-        try std.testing.expect(@abs(cpu_sum - gpu_sum) <= sum_tolerance);
+        try determinism.expectScalar(.tolerant, .accumulated, cpu_sum, gpu_sum);
 
         var gpu_max: f32 = 0;
         try runWithContext(&context, .max, &gpu_max, input);
-        try std.testing.expectEqual(referenceMax(input), gpu_max);
+        try determinism.expectScalar(.tolerant, .discrete, referenceMax(input), gpu_max);
     }
 }
 
@@ -484,7 +489,8 @@ test "reduce gpu sum is exact for exactly-representable inputs" {
 
     var gpu_sum: f32 = 0;
     try runWithContext(&context, .sum, &gpu_sum, input);
-    try std.testing.expectEqual(@as(f32, @floatFromInt(n)), gpu_sum);
+    // `.exact` 档在这里是可用的：数学上就该逐位相等（累加项与中间和都 < 2^24）。
+    try determinism.expectScalar(.exact, .accumulated, @as(f32, @floatFromInt(n)), gpu_sum);
 }
 
 test "reduce canRun honours storage and dispatch limits" {

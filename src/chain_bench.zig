@@ -13,6 +13,7 @@
 //! always "faster with identical results".
 
 const std = @import("std");
+const determinism = @import("determinism.zig");
 const runtime = @import("runtime.zig");
 const wgpu = @import("gpu/webgpu.zig");
 const bench = @import("bench.zig");
@@ -414,7 +415,10 @@ test "runtime saxpy chain matches the cpu reference in every mode" {
 
     for ([_]Mode{ .per_call, .per_submit, .chained }) |mode| {
         const result = try runSaxpyChain(gpa, ctx, n, steps, mode, alpha, initial, y, out);
-        try std.testing.expect(result.max_diff <= 1e-4);
+        // saxpy 链的数值量级 O(1)，沿用既有绝对/相对判据（tolerant/accumulated）。
+        try std.testing.expect(
+            determinism.tolerance(.tolerant, .accumulated).within(result.max_diff, 1.0),
+        );
         try std.testing.expect(result.total_ns > 0);
     }
 }
@@ -449,7 +453,12 @@ test "runtime gemm+bias+reduce chain matches the cpu reference" {
     for ([_]PipelineMode{ .staged, .chained }) |mode| {
         var sum: f32 = 0;
         const result = try runGemmBiasReduceChain(gpa, ctx, m, k, n, mode, 3, a, b, bias, &sum);
-        try std.testing.expect(result.relativeDiff() <= 1e-4);
+        try std.testing.expect(
+            determinism.tolerance(.tolerant, .accumulated).within(
+                result.max_diff,
+                @abs(@as(f64, result.reference)),
+            ),
+        );
         try std.testing.expect(result.total_ns > 0);
     }
 }

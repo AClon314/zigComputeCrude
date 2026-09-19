@@ -16,6 +16,7 @@
 //! readback) on top of a device+shape buffer cache.
 
 const std = @import("std");
+const determinism = @import("../determinism.zig");
 const runtime = @import("../runtime.zig");
 const context_mod = @import("context.zig");
 const GpuContext = context_mod.GpuContext;
@@ -535,12 +536,19 @@ fn fillDeterministic(data: []f32, seed: usize) void {
     }
 }
 
-fn expectClose(expected: []const f32, actual: []const f32, tolerance: f32) !void {
-    if (expected.len != actual.len) return error.TestExpectedApproxEq;
-    for (expected, actual) |e, value| {
-        const scale = @max(1.0, @abs(e));
-        if (@abs(e - value) > tolerance * scale) return error.TestExpectedApproxEq;
-    }
+/// GPU 路径的统一判据（tolerant/accumulated = 1e-4，见 determinism.zig 的表）。
+fn expectClose(expected: []const f32, actual: []const f32) !void {
+    return determinism.expectSlices(.tolerant, .accumulated, f32, expected, actual);
+}
+
+/// CPU scalar 与 CPU SIMD 只差累加顺序，既有判据是 1e-5，比 GPU 路径更紧。
+fn expectCloseSameBackendFamily(expected: []const f32, actual: []const f32) !void {
+    return determinism.expectSlicesWithin(
+        .{ .absolute = 1e-5, .relative = 1e-5 },
+        f32,
+        expected,
+        actual,
+    );
 }
 
 test "gemm cpu scalar and simd references agree on edge shapes" {
@@ -562,7 +570,7 @@ test "gemm cpu scalar and simd references agree on edge shapes" {
         fillDeterministic(b, 2);
         referenceScalar(m, k, n, a, b, out_scalar);
         referenceSimd(m, k, n, a, b, out_simd);
-        try expectClose(out_scalar, out_simd, 1e-5);
+        try expectCloseSameBackendFamily(out_scalar, out_simd);
     }
 }
 
@@ -605,7 +613,7 @@ test "gemm gpu simple and tiled variants match the cpu reference" {
             if (!canRun(context.limits, m, k, n, variant)) continue;
             @memset(actual, 0);
             try runWithContext(&context, variant, m, k, n, a, b, actual);
-            try expectClose(reference, actual, 1e-4);
+            try expectClose(reference, actual);
             verified += 1;
         }
     }
@@ -646,7 +654,7 @@ test "gemm batched long gpu work does not expire the readback wait" {
     // The next submit reuses the same staging buffer; under the old behavior
     // this is where the fatal "still mapped" validation error appeared.
     try runWithContext(&context, .tiled, m, k, n, a, b, single);
-    try expectClose(batched, single, 1e-4);
+    try expectClose(batched, single);
 }
 
 test "gemm canRun rejects shapes outside device limits" {

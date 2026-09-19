@@ -31,7 +31,13 @@ Blender/节点的语义（域模型、属性传播、节点图求值、色彩/�
    否则下一次 `wgpuQueueSubmit` 会触发 wgpu-native 的 fatal `buffer is still mapped`
    （abort，error scope 捕不到）。
 5. **对拍是契约**：任何新内核/新后端都必须有 CPU 参考实现，并在测试或 CLI 里逐元素对拍；
-   浮点用**明确的容差**（相对容差见下），不得放宽到"看起来差不多"。
+   浮点用**明确的容差**，不得放宽到"看起来差不多"。判据集中在 `src/determinism.zig`：
+   按**类**取值——`discrete`（整数/索引/计数/max：**任何档位下都精确相等**）与
+   `scalar` / `accumulated`（f32 单次舍入 / 多次舍入累加：按 `tolerant` 表给量级）；
+   档位（`exact`/`tolerant`/`fast`）是 **comptime 参数**，CLI 用 `--precision` 做一次三路派发，
+   比较循环里没有分支。新增断言时用 `determinism.expectSlices/expectScalar`，
+   不要在新代码里再写裸的 `1e-4`（同一后端家族内部的更紧判据用
+   `expectSlicesWithin/expectScalarWithin` 显式写出，必须说明理由）。
 6. **不 kill 任何进程**（包括 pi）；长任务用后台 + 轮询。
 7. **不伪造实测结论**：性能/正确性数字必须来自真实运行，且说明机器是否独占、是否取中位数。
 
@@ -76,10 +82,11 @@ src/gpu/gemm.zig      # GEMM simple/tiled + CPU 参考 + 对拍测试
 src/gpu/reduce.zig    # reduce sum/max + CPU 参考 + 对拍测试
 src/runtime*.zig      # M0：Buffer / Kernel / Chain（常驻 + 链式）
 src/chain_bench.zig   # M0 消融基准（saxpy 链、GEMM→bias→reduce 链）
+src/determinism.zig   # 对拍判据表（Class × Precision，comptime 零开销；见 §1.5）
 ```
 
 v2 目标布局（迁移路径见 `docs/node-system-migration.md` §6）：`runtime/`、
-`backends/{cpu,webgpu}/`、`primitives/`、`determinism.zig`、`capability.zig`。
+`backends/{cpu,webgpu}/`、`primitives/`、`determinism.zig`（已落地）、`capability.zig`。
 迁移规则：**旧的按 kernel 划分的 shape-keyed cache 逐步并入 runtime.Buffer**，
 新内核一律走 `runtime.Kernel` + `Chain`。**全部内置 kernel 已迁移**：add/saxpy（`primitives/elementwise.zig`；
 `gpu/pipeline.zig` 是兼容 shim）、gemm（`Kernels` + `VariantCache`）、
