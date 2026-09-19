@@ -443,7 +443,8 @@ GEMM→bias→reduce 异质链，结果与 CPU 参考对拍。`backends/`、`pri
   天然落在精确档。实现形态：`Class = discrete | scalar | accumulated` 的判据表 +
   `Precision = exact | tolerant | fast`（**comptime 参数**，零运行时分支；
   CLI `--precision` 在 demo 层做一次三路派发）；`discrete` 在任何档位下都不放松。
-  实测：`--precision exact` 下 f32 累加链（GEMM→bias→reduce）如预期 MISMATCH（rel 3.70e-6），
+  实测：`--precision exact` 下 f32 累加链（GEMM→bias→reduce）如预期 MISMATCH（rel 3.70e-6；
+  SIMD 归约多累加器优化后为 2.64e-6，见 `docs/perf-tooling-and-comptime.md`），
   而整数/索引路径仍 OK —— 这就是"科学计算要精确、游戏要快"的实际分界；
 - 测试基建：把现有"CPU 参考 + `max|diff|`"扩成"同一 IR 跑所有后端对拍"。
 

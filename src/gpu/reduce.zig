@@ -369,30 +369,55 @@ pub fn referenceMax(input: []const f32) f32 {
 /// Target-width CPU reference (vectorWidth() lanes).  The lane-wise partial
 /// sums use a different association order than the scalar reference (and than
 /// the GPU), so callers compare with a tolerance instead of bit equality.
+/// CPU SIMD 归约的**独立累加器个数**（comptime 旋钮）。
+///
+/// 单个向量累加器时，内层 `lanes += values` 是一条长度 = len/width 的依赖链，
+/// 只受 FMA/加法延迟限制；拆成 ACC 条链就能吃满加载带宽。实测（Ryzen 5 5600H/AVX2，
+/// W=8，CLI 三跑中位数，见 commit message）：sum 16 MiB 24.0 → 29.1 GB/s，
+/// **256 KiB（L2 内）44.5 → 94.5 GB/s（2.1x）**——即小尺寸下它原本是延迟受限而非带宽受限。
+/// 值越大寄存器压力越大，故选 4；ACC=1 等价于"不做并行累加"。
+pub const acc_vectors: usize = 4;
+
 pub fn referenceSumSimd(input: []const f32) f32 {
+    return referenceSumSimdAcc(acc_vectors, input);
+}
+
+pub fn referenceMaxSimd(input: []const f32) f32 {
+    return referenceMaxSimdAcc(acc_vectors, input);
+}
+
+pub fn referenceSumSimdAcc(comptime ACC: usize, input: []const f32) f32 {
     const V = @Vector(vectorWidth(), f32);
     const width = vectorWidth();
-    var lanes: V = @splat(0);
+    var lanes: [ACC]V = .{@as(V, @splat(0))} ** ACC;
     var index: usize = 0;
-    while (index + width <= input.len) : (index += width) {
-        const values: V = @as(*align(1) const V, @ptrCast(input.ptr + index)).*;
-        lanes += values;
+    while (index + width * ACC <= input.len) : (index += width * ACC) {
+        inline for (0..ACC) |a| {
+            const values: V = @as(*align(1) const V, @ptrCast(input.ptr + index + a * width)).*;
+            lanes[a] += values;
+        }
     }
-    var total: f32 = @reduce(.Add, lanes);
+    var merged: V = lanes[0];
+    inline for (1..ACC) |a| merged += lanes[a];
+    var total: f32 = @reduce(.Add, merged);
     while (index < input.len) : (index += 1) total += input[index];
     return total;
 }
 
-pub fn referenceMaxSimd(input: []const f32) f32 {
+pub fn referenceMaxSimdAcc(comptime ACC: usize, input: []const f32) f32 {
     const V = @Vector(vectorWidth(), f32);
     const width = vectorWidth();
-    var lanes: V = @splat(-std.math.inf(f32));
+    var lanes: [ACC]V = .{@as(V, @splat(-std.math.inf(f32)))} ** ACC;
     var index: usize = 0;
-    while (index + width <= input.len) : (index += width) {
-        const values: V = @as(*align(1) const V, @ptrCast(input.ptr + index)).*;
-        lanes = @max(lanes, values);
+    while (index + width * ACC <= input.len) : (index += width * ACC) {
+        inline for (0..ACC) |a| {
+            const values: V = @as(*align(1) const V, @ptrCast(input.ptr + index + a * width)).*;
+            lanes[a] = @max(lanes[a], values);
+        }
     }
-    var total: f32 = @reduce(.Max, lanes);
+    var merged: V = lanes[0];
+    inline for (1..ACC) |a| merged = @max(merged, lanes[a]);
+    var total: f32 = @reduce(.Max, merged);
     while (index < input.len) : (index += 1) total = @max(total, input[index]);
     return total;
 }

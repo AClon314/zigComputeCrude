@@ -431,6 +431,27 @@ pub fn referenceScalar(
     }
 }
 
+/// CPU 侧寄存器分块的行数 —— **comptime 旋钮**（不是运行时参数）。
+///
+/// 内层是 i-k-j：每读一行 B 的 `width` 个元素，就服务 ROWS 个输出行；B 的读取量因此是
+/// `(m/ROWS) * k * n`，ROWS 直接决定"每字节 B 换来多少次 FMA"。实测（Ryzen 5 5600H /
+/// AVX2，W=8，64-bit 三跑取最大，prototype 见 commit message）：
+///
+///   ROWS    256³     512³     1024³
+///    4     54.8     47.1     25.5   GFLOP/s
+///    6     74.2     62.8     42.3
+///    8     86.2     72.8     51.4   ← 选它
+///   10     92.0     70.7     52.4
+///   12     89.4     80.7     39.5   （寄存器溢出，1024³ 反弹）
+///
+/// 8 在三个尺寸上都稳（1.6~2.0x vs ROWS=4），10/12 收益不稳定；ROWS × width 个向量
+/// 累加器要放进 16 个 AVX2 寄存器，所以不能无限加。`noalias` 实测无差别（±1%），
+/// 故不加——那会引入"输出不得与输入别名"的隐性契约。
+pub const cpu_block_rows: usize = 8;
+
+/// C = A * B，行主序，累加顺序 k 升序（与两个 WGSL kernel 一致）。
+/// 每行 ROWS 个输出行并行累加；**舍入顺序与 ROWS 无关**（每个输出元素仍是 k 升序
+/// `@mulAdd`），所以这个旋钮不影响对拍结果，只影响速度。
 pub fn referenceSimd(
     m: usize,
     k: usize,
@@ -439,66 +460,74 @@ pub fn referenceSimd(
     b: []const f32,
     out: []f32,
 ) void {
+    referenceSimdBlocked(cpu_block_rows, m, k, n, a, b, out);
+}
+
+/// `referenceSimd` 的 comptime 分块版本。ROWS 是编译期常量 → 累加器全部静态展开
+/// 到寄存器，内层没有数组索引/边界分支（这正是 comptime 在这里买到的东西）。
+pub fn referenceSimdBlocked(
+    comptime ROWS: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    a: []const f32,
+    b: []const f32,
+    out: []f32,
+) void {
+    comptime if (ROWS == 0 or ROWS > 16) @compileError("ROWS out of range");
     const width = vectorWidth();
     const V = @Vector(width, f32);
     @memset(out[0 .. m * n], 0);
 
-    // Register blocking: 4 output rows x `width` columns per inner step.  Keeping
-    // the four accumulators in vector registers (instead of reading/writing the
-    // output vector for every k) removes the store-to-load dependency and cut
-    // the memory traffic per MAC by ~8x versus the naive i-k-j SIMD loop.
+    // Register blocking: ROWS output rows x `width` columns per inner step.  Keeping
+    // the accumulators in vector registers (instead of reading/writing the output
+    // vector for every k) removes the store-to-load dependency and cuts the memory
+    // traffic per MAC by roughly ROWS x versus the naive i-k-j SIMD loop.
     var row: usize = 0;
-    while (row < m) : (row += 4) {
-        const r0 = row;
+    while (row < m) : (row += ROWS) {
         // Clamp the padding rows to the last valid row; their results are
         // discarded below, which keeps the hot loop branch-free.
-        const r1 = @min(row + 1, m - 1);
-        const r2 = @min(row + 2, m - 1);
-        const r3 = @min(row + 3, m - 1);
+        var rows_index: [ROWS]usize = undefined;
+        var rows_valid: [ROWS]bool = undefined;
+        inline for (0..ROWS) |r| {
+            rows_index[r] = @min(row + r, m - 1);
+            rows_valid[r] = row + r < m;
+        }
 
         var col: usize = 0;
         while (col + width <= n) : (col += width) {
-            var acc0: V = @splat(0);
-            var acc1: V = @splat(0);
-            var acc2: V = @splat(0);
-            var acc3: V = @splat(0);
+            var acc: [ROWS]V = undefined;
+            inline for (0..ROWS) |r| acc[r] = @splat(0);
             for (0..k) |kk| {
                 const bv: V = @as(*align(1) const V, @ptrCast(b.ptr + kk * n + col)).*;
-                const a0: V = @splat(a[r0 * k + kk]);
-                const a1: V = @splat(a[r1 * k + kk]);
-                const a2: V = @splat(a[r2 * k + kk]);
-                const a3: V = @splat(a[r3 * k + kk]);
-                // Explicit @mulAdd: Zig strict FP does not contract a*b+c into
-                // FMA, and without it the inner loop is 2x the arithmetic
-                // instructions (vmulps+vaddps instead of vfmadd).
-                acc0 = @mulAdd(V, a0, bv, acc0);
-                acc1 = @mulAdd(V, a1, bv, acc1);
-                acc2 = @mulAdd(V, a2, bv, acc2);
-                acc3 = @mulAdd(V, a3, bv, acc3);
+                inline for (0..ROWS) |r| {
+                    const av: V = @splat(a[rows_index[r] * k + kk]);
+                    // Explicit @mulAdd: Zig strict FP does not contract a*b+c into
+                    // FMA, and without it the inner loop is 2x the arithmetic
+                    // instructions (vmulps+vaddps instead of vfmadd).
+                    acc[r] = @mulAdd(V, av, bv, acc[r]);
+                }
             }
-            @as(*align(1) V, @ptrCast(out.ptr + r0 * n + col)).* = acc0;
-            if (row + 1 < m) @as(*align(1) V, @ptrCast(out.ptr + r1 * n + col)).* = acc1;
-            if (row + 2 < m) @as(*align(1) V, @ptrCast(out.ptr + r2 * n + col)).* = acc2;
-            if (row + 3 < m) @as(*align(1) V, @ptrCast(out.ptr + r3 * n + col)).* = acc3;
+            inline for (0..ROWS) |r| {
+                if (rows_valid[r]) {
+                    @as(*align(1) V, @ptrCast(out.ptr + rows_index[r] * n + col)).* = acc[r];
+                }
+            }
         }
 
         // Column tail (n % width), accumulated in the same k order.
         while (col < n) : (col += 1) {
-            var sum0: f32 = 0;
-            var sum1: f32 = 0;
-            var sum2: f32 = 0;
-            var sum3: f32 = 0;
+            var sums: [ROWS]f32 = undefined;
+            inline for (0..ROWS) |r| sums[r] = 0;
             for (0..k) |kk| {
                 const bv = b[kk * n + col];
-                sum0 = @mulAdd(f32, a[r0 * k + kk], bv, sum0);
-                sum1 = @mulAdd(f32, a[r1 * k + kk], bv, sum1);
-                sum2 = @mulAdd(f32, a[r2 * k + kk], bv, sum2);
-                sum3 = @mulAdd(f32, a[r3 * k + kk], bv, sum3);
+                inline for (0..ROWS) |r| {
+                    sums[r] = @mulAdd(f32, a[rows_index[r] * k + kk], bv, sums[r]);
+                }
             }
-            out[r0 * n + col] = sum0;
-            if (row + 1 < m) out[r1 * n + col] = sum1;
-            if (row + 2 < m) out[r2 * n + col] = sum2;
-            if (row + 3 < m) out[r3 * n + col] = sum3;
+            inline for (0..ROWS) |r| {
+                if (rows_valid[r]) out[rows_index[r] * n + col] = sums[r];
+            }
         }
     }
 }
@@ -549,6 +578,35 @@ fn expectCloseSameBackendFamily(expected: []const f32, actual: []const f32) !voi
         expected,
         actual,
     );
+}
+
+test "referenceSimdBlocked is bit-identical across register block sizes" {
+    // ROWS 只改变"同时算几个输出行"，不改变每个输出元素的 k 升序 @mulAdd 顺序，
+    // 所以不同 ROWS 必须逐位一致（这也是它敢做默认旋钮的前提）。
+    const gpa = std.testing.allocator;
+    for (test_shapes) |shape| {
+        const m = shape[0];
+        const k = shape[1];
+        const n = shape[2];
+        const a = try gpa.alloc(f32, m * k);
+        defer gpa.free(a);
+        const b = try gpa.alloc(f32, k * n);
+        defer gpa.free(b);
+        const reference = try gpa.alloc(f32, m * n);
+        defer gpa.free(reference);
+        const actual = try gpa.alloc(f32, m * n);
+        defer gpa.free(actual);
+
+        fillDeterministic(a, 3);
+        fillDeterministic(b, 4);
+        referenceSimdBlocked(4, m, k, n, a, b, reference);
+
+        inline for ([_]usize{ 1, 2, 3, 8, 16 }) |rows| {
+            @memset(actual, 0);
+            referenceSimdBlocked(rows, m, k, n, a, b, actual);
+            try std.testing.expectEqualSlices(f32, reference, actual);
+        }
+    }
 }
 
 test "gemm cpu scalar and simd references agree on edge shapes" {

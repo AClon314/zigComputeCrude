@@ -181,8 +181,11 @@ host 运行时（Buffer/Kernel/Chain）、对拍契约、以及 spatial 这类�
 
 | adapter | staged | chained | submit_cut | chained GFLOP/s | verify |
 |---|---|---|---|---|---|
-| iGPU | 121.4 ms | 87.5 ms | **1.39x** | 196.4 | OK (rel 3.70e-6) |
-| dGPU | 94.5 ms | 35.2 ms | **2.69x** | **488.7** | OK (rel 3.70e-6) |
+| iGPU | 121.4 ms | 87.5 ms | **1.39x** | 196.4 | OK (rel 3.70e-6)¹ |
+| dGPU | 94.5 ms | 35.2 ms | **2.69x** | **488.7** | OK (rel 3.70e-6)¹ |
+
+¹ 本表测于 SIMD 归约多累加器优化**之前**（见 `docs/perf-tooling-and-comptime.md` §3.2）；
+该优化改变了归约的结合顺序，当前 chain 的 `rel` 为 2.64e-6。
 
 `--kernel reduce --size 16777216`：iGPU 19.8 GB/s vs dGPU 19.9 GB/s —— **无差别**，
 因为这条路径是"1 次上传 + 5 次归约 + 1 次回读"的搬运主导，换 GPU 不改 PCIe 带宽。
@@ -257,7 +260,7 @@ host 运行时（Buffer/Kernel/Chain）、对拍契约、以及 spatial 这类�
 2. ~~**（做）确定性分级门禁**~~ **已完成**（2026-09-19）：`src/determinism.zig`
    （`Class = discrete/scalar/accumulated` × `Precision = exact/tolerant/fast`，comptime 零开销），
    gemm/reduce/chain_bench/main 全部改走判据表，CLI 加 `--precision`；
-   实测 `--precision exact` 下 f32 累加链 MISMATCH（rel 3.70e-6）而离散路径全绿。
+   实测 `--precision exact` 下 f32 累加链 MISMATCH（rel 2.64e-6）而离散路径全绿。
 3. **（写）把本文件作为"新前端准入条件"的依据**，链到 `node-system-migration.md` §5.6 / §7.1。
 4. **（可选）给 Zig 上游报告两个崩溃**（都是最小复现，5 行以内）：
    - `@workGroupId(0) * @workGroupSize(0)` 在 `amdgcn-amdhsa-none` 上 panic；
@@ -273,7 +276,7 @@ host 运行时（Buffer/Kernel/Chain）、对拍契约、以及 spatial 这类�
 ## 8. 未做的验证（诚实声明）
 
 - 没有在 NVIDIA 上跑 Vulkan-compute（我们的 wgpu-native 路径在 dGPU 上只测了 GEMM/chain/reduce 三种，
-  未测 spatial；dGPU 数值与 iGPU 一致：GEMM `max|diff| = 0`，chain `rel 3.70e-6`）。
+  未测 spatial；dGPU 数值与 iGPU 一致：GEMM `max|diff| = 0`，chain `rel 3.70e-6`（当时）。
 - 没有实测 D3D12/DXC 与 RADV 之间的浮点差异（§6 的跨厂商结论来自规范文本，不是本机测量）。
 - 没有把 Zig 的 SPIR-V 输出喂给 `wgpuDeviceCreateShaderModule` 做端到端验证
   （按 §3.1 它连 `spirv-val` 都过不了，没到那一步）。

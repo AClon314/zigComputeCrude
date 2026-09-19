@@ -10,6 +10,7 @@
 - 架构与后续路线（Blender 节点系统迁移评估）：`docs/node-system-migration.md`
 - 依赖说明：`deps/README.md`
 - GPU 选型与生态核查：`docs/gpu-backend-research.md`、`docs/zig-gpu-spike.md`（Zig 当 kernel 语言的实测否决）
+- 性能分析与 comptime 判据（工具 + A/B 实测）：`docs/perf-tooling-and-comptime.md`
 
 ---
 
@@ -243,15 +244,16 @@ zig build run -- --kernel reduce --size 16777216 --op sum --precision fast
 | chain pipeline 64 reps（chained） | 197.4 GFLOP/s | **490.6 GFLOP/s** | 2.49x |
 | chain pipeline 64 reps（submit_cut） | 1.34x | **2.69x** | — |
 | reduce 16M sum（gpu_batch） | 20.6 GB/s | 19.9 GB/s | 0.97x（搬运主导） |
+| spatial 256K 仅查询（稳态） | 2.64 ms | **0.61 ms** | **4.33x**（随机访存） |
 
 结论：**链式（M0）的价值在独显上更大**（每次 submit+readback 往返更贵：iGPU 1.34x vs dGPU 2.69x），
-而在共享内存 iGPU 上测出的数字会低估它。所有对拍不变（GEMM `max|diff| = 0`，chain `rel 3.70e-6`）。
+而在共享内存 iGPU 上测出的数字会低估它。所有对拍不变（GEMM `max|diff| = 0`，chain `rel 2.64e-6`）。
 
 ### 判据分档（`--precision`，ReleaseFast；判据不参与计时）
 
 | 负载 | class | `exact` | `tolerant`（默认） | `fast` |
 |---|---|---|---|---|
-| chain pipeline（GEMM→bias→reduce，16 reps） | accumulated | **MISMATCH**（rel 3.70e-6，abs 2.8e2 / sum 7.57e7） | OK | OK |
+| chain pipeline（GEMM→bias→reduce，16 reps） | accumulated | **MISMATCH**（rel 2.64e-6，abs 2.0e2 / sum 7.57e7） | OK | OK |
 | reduce sum（f32 累加） | accumulated | OK（该 shape 实测 `|diff| = 0`） | OK | OK |
 | reduce max（无舍入） | discrete | OK（0 容差） | OK | OK |
 | GEMM 512³ tiled（tolerance 打印值） | accumulated | tol 0 | tol 7.5e-2 | tol 7.5 |
@@ -260,7 +262,7 @@ zig build run -- --kernel reduce --size 16777216 --op sum --precision fast
 两个要点：
 
 1. **exact 档在 f32 累加上"故意"不过**：GEMM→bias→reduce 的最终标量与 CPU 参考差
-   `rel 3.70e-6`（纯累加顺序；WGSL §15.7.5 明确允许实现重结合/融合，所以跨厂商 bit 一致
+   `rel 2.64e-6`（纯累加顺序；WGSL §15.7.5 明确允许实现重结合/融合，所以跨厂商 bit 一致
    不可得）。exact 档的价值就在于此：它把"这里对不上是真 bug"与"浮点顺序差"分开，
    索引/计数/max 走 exact 永远绿灯。
 2. **档位不影响性能**：判据在计时区之外，三档 gemm 512³ 为 202.8/202.6/203.5 GFLOP/s（噪声级）。
@@ -288,7 +290,7 @@ zig build run -- --kernel reduce --size 16777216 --op sum --precision fast
 | 256³ | 1 / 4 / 16 | 1.28 / 2.22 / 8.30 ms  | 0.95 / 1.27 / 4.51 ms  | 1.34x / 1.75x / **1.84x** | 35 / 105 / 119  |
 | 512³ | 1 / 4 / 16 | 2.90 / 8.58 / 30.75 ms | 1.97 / 6.33 / 22.70 ms | 1.47x / 1.36x / **1.35x** | 136 / 170 / 189 |
 
-异质链对拍用相对容差（`rel ≤ 1e-4`，实测 1.9e-6~3.7e-6，仅 f32 累加顺序差异）。
+异质链对拍用相对容差（`rel ≤ 1e-4`，实测 1.9e-6~2.6e-6，仅 f32 累加顺序差异）。
 512³ 的加速比小于 256³，因为计算占比上升、回读占比下降——这也说明链式收益与
 "每步数据量 / 计算量之比"直接相关。
 
@@ -308,20 +310,25 @@ CLI 还会验证固定容量邻接表（K=16）：对未被截断的查询比较
 
 ### 内核基线（ReleaseFast，端到端含上传+回读；对拍 `max|diff| = 0`）
 
-| workload       | cpu_simd     | gpu_simple   | gpu_tiled     | gpu_tiled(稳态) |
-| -------------- | ------------ | ------------ | ------------- | --------------- |
-| GEMM 512³      | 33.3 GFLOP/s | 79.0 (2.4x)  | 173.0 (5.2x)  | 218.2 (6.6x)    |
-| GEMM 1024³     | 17.8         | 28.8 (1.6x)  | 196.3 (11.0x) | 226.8 (12.7x)   |
-| GEMM 2048³     | 12.5         | —            | 215.1 (17.3x) | 230.4 (18.5x)   |
-| reduce 4M sum  | 30.5 GB/s    | 6.1 (端到端) | —             | 14.3 (稳态)     |
-| reduce 16M sum | 25.5         | 7.0          | —             | 25.1（≈打平）   |
+| workload       | cpu_simd     | gpu_simple        | gpu_tiled          | gpu_tiled(稳态)    |
+| -------------- | ------------ | ----------------- | ------------------ | ------------------ |
+| GEMM 512³      | 60.3 GFLOP/s | 75.5 (1.3x)       | 175.3 (2.9x)       | 216.8 (3.6x)       |
+| GEMM 1024³     | 42.9         | 29.1 (0.7x)       | 194.0 (4.5x)       | 226.3 (5.3x)       |
+| GEMM 2048³     | —（见注）    | —                 | —                  | —                  |
+| reduce 4M sum  | 45.8 GB/s    | 6.1 (端到端)      | —                  | 18.3 (稳态)        |
+| reduce 16M sum | 29.7         | 7.0               | —                  | 26.2（**输给 CPU**）|
 
 参考（历史验收，Debug）：`add` 1<<20 时 CPU SIMD 14.7 GB/s、GPU 端到端 4.7 GB/s、
 GPU 稳态 16.2 GB/s —— 这正是 M0 runtime 要解决的问题。
 
-**诚实结论**：GEMM 这类高算力密度内核单次就能赢；reduce/saxpy 这类纯流式 kernel
-在共享内存的 iGPU 上只能到"打平 CPU SIMD"，真正价值是**链式**（5.8x over per-call）
-而不是单步吞吐。
+**诚实结论**：GEMM 这类高算力密度内核单次就能赢（CPU SIMD 一侧经 comptime 分块优化后
+也快了 1.5~2.4x，但差距仍有 3~5x）；reduce/saxpy 这类纯流式 kernel 现在**端到端输给
+CPU SIMD**（CPU 侧 SIMD 归约经多累加器优化后在 16 MiB 上 29.7 GB/s，GPU 稳态 26.2 GB/s），
+真正价值是**链式**（5.8x over per-call）而不是单步吞吐。
+
+注：CPU 侧两个 comptime 旋钮（GEMM 分块行数、归约累加器）的实测与判定见
+`docs/perf-tooling-and-comptime.md`；`GEMM 2048³` 本次会话在本机 iGPU 上复现
+"Parent device is lost"（wgpu-native 直接 abort，未取到数），故此行为空。
 
 ---
 

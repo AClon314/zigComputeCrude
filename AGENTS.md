@@ -159,6 +159,14 @@ tree-shake 门禁有正负两侧：`build.zig` 里的 probe 只调用 CPU 路径
   在浏览器端需要由 rAF pump 驱动（移植时注意）。
 - **测量失真**：纯归约会被 LICM 提出循环（`timeReduceCpu` 每轮扰动一个元素）；
   基准先 warmup 再计时（`--kernel chain` 已内置）。
+- **comptime 不是万能的**：先判断内核"等内存"还是"等依赖链"再动手（工具与 A/B 结果见
+  `docs/perf-tooling-and-comptime.md`）。已落地的两个 comptime 旋钮：
+  `gpu/gemm.zig::cpu_block_rows`（寄存器分块行数，1.5~2.4x）、
+  `gpu/reduce.zig::acc_vectors`（SIMD 归约累加器数，L2 内 2.2x）；
+  **实测无收益、明确不加**的：elementwise 循环展开（纯流式失配，cachegrind 显示 D1 失配
+  99.97% 直达内存）、把 WGSL 的 kNN 容量 K 变成编译期常量（该 kernel 是访存延迟受限）。
+  判据：性能结论只认 `-Doptimize=ReleaseFast` 下 CLI 多次中位数（机器非独占，小尺寸波动 ±20%），
+  不认单次最优值、不认"看起来更快"的直觉。
 - **indirect buffer 的 usage 排他**：同一个 dispatch 里，buffer 不能既作为
   `dispatchIndirect` 的来源又绑定为 storage（wgpu usage scope 报
   "STORAGE_READ_WRITE ... cannot be used with ... INDIRECT"，且 `wgpuQueueSubmit`
