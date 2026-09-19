@@ -107,6 +107,8 @@ pub const ProbeResult = struct {
     adapter_vendor_id: u32 = 0,
     /// Which preference produced this adapter (`.auto` is the C default).
     preference: AdapterPreference = .auto,
+    /// 完整选择（含 force_fallback），用于日志/消融表。
+    selection: AdapterSelection = .{},
     /// Fixed-size copy of `WGPUAdapterInfo`, so the result stays valid after
     /// the raw string views are freed and needs no allocation.
     adapter_info: AdapterInfo = .{},
@@ -172,17 +174,37 @@ pub const AdapterPreference = enum {
     }
 };
 
-/// One adapter selection.  A struct (rather than a bare enum) so fields like
-/// "must be a discrete GPU" can be added without changing call sites; the
-/// actual filtering is still done by `powerPreference`.
+/// `AdapterSelection` 的缓存槽：3 个偏好 + 1 个软件 fallback 槽。
+fn selectionSlot(selection: AdapterSelection) usize {
+    if (selection.force_fallback) return 3;
+    return selection.preference.slot();
+}
+
+/// One adapter selection.  A struct (rather than a bare enum) so extra knobs can
+/// be added without changing call sites.
 pub const AdapterSelection = struct {
     preference: AdapterPreference = .auto,
+    /// Ask for the implementation's fallback (software) adapter — wgpu-native 会
+    /// 给 Mesa llvmpipe，浏览器端 `forceFallbackAdapter` 会给 SwiftShader。
+    /// 用途：验证"软件适配器上也能跑对"（慢，但 ABI/对拍契约一致）。
+    force_fallback: bool = false,
+
+    pub fn label(self: AdapterSelection) []const u8 {
+        if (self.force_fallback) return "fallback(software)";
+        return self.preference.name();
+    }
 };
 
 /// Fixed-size, allocation-free copy of the selected adapter's `WGPUAdapterInfo`.
 pub const AdapterInfo = struct {
     description_buf: [96]u8 = [_]u8{0} ** 96,
     description_len: u8 = 0,
+    /// 浏览器（emdawnwebgpu）只填 vendor/architecture，`description`/`device`
+    /// 因隐私是空的，所以分类必须能看这两个字段。native 侧则反过来更全。
+    vendor_buf: [32]u8 = [_]u8{0} ** 32,
+    vendor_len: u8 = 0,
+    architecture_buf: [32]u8 = [_]u8{0} ** 32,
+    architecture_len: u8 = 0,
     vendor_id: u32 = 0,
     device_id: u32 = 0,
     adapter_type: wgpu.WGPUAdapterType = wgpu.WGPUAdapterType_Unknown,
@@ -193,6 +215,65 @@ pub const AdapterInfo = struct {
     /// `self`, so a by-value receiver would hand back a dangling slice.
     pub fn description(self: *const AdapterInfo) []const u8 {
         return self.description_buf[0..self.description_len];
+    }
+
+    pub fn vendor(self: *const AdapterInfo) []const u8 {
+        return self.vendor_buf[0..self.vendor_len];
+    }
+
+    pub fn architecture(self: *const AdapterInfo) []const u8 {
+        return self.architecture_buf[0..self.architecture_len];
+    }
+
+    /// 硬件适配器的粗分类（来自驱动的 `adapterType`，native 侧可信；
+    /// 浏览器侧 emdawnwebgpu 一律报 Unknown，见 `isSoftware`）。
+    pub fn kind(self: AdapterInfo) AdapterKind {
+        return switch (self.adapter_type) {
+            wgpu.WGPUAdapterType_DiscreteGPU => .discrete,
+            wgpu.WGPUAdapterType_IntegratedGPU => .integrated,
+            wgpu.WGPUAdapterType_CPU => .software,
+            else => .unknown,
+        };
+    }
+
+    /// 是否是软件光栅化/模拟器（CPU 上跑的"GPU"）。
+    ///
+    /// 判据分两级：
+    ///  1. **权威**：驱动报 `adapterType == CPU`（native 的 llvmpipe 与浏览器的
+    ///     SwiftShader 都会报，实测 Chrome 里只有 fallback 适配器填了 type=3）；
+    ///  2. **启发式**：`vendor/architecture/description` 命中已知软件实现名。
+    ///     因为 emdawnwebgpu 不填 `adapterType`（实测 nvidia/amd/swiftshader 里
+    ///     只有 swiftshader 有 type），浏览器里没有别的办法分辨"软件适配器"。
+    ///     名字表只收确定是软件实现的关键词，宁漏不误。
+    pub fn isSoftware(self: *const AdapterInfo) bool {
+        if (self.kind() == .software) return true;
+        const software_markers = [_][]const u8{
+            "swiftshader",            // Chrome/Dawn 的软件 Vulkan
+            "llvmpipe",               // Mesa 软件 Vulkan
+            "lavapipe",               // Mesa 软件 Vulkan（LunarG 名）
+            "softpipe",               // Mesa 软件 GL
+            "software rasterizer",    // 通用描述
+            "software adapter",       // 通用描述
+            "microsoft basic render", // D3D WARP/基本渲染驱动
+        };
+        for (software_markers) |marker| {
+            if (containsIgnoreCase(self.vendor(), marker)) return true;
+            if (containsIgnoreCase(self.architecture(), marker)) return true;
+            if (containsIgnoreCase(self.description(), marker)) return true;
+        }
+        return false;
+    }
+
+    /// 给日志/CLI 用的一行式路径标签：`gpu/discrete`、`gpu/integrated`、
+    /// `gpu/software` 或 `gpu/unknown`。
+    pub fn pathLabel(self: *const AdapterInfo) []const u8 {
+        if (self.isSoftware()) return "gpu/software";
+        return switch (self.kind()) {
+            .discrete => "gpu/discrete",
+            .integrated => "gpu/integrated",
+            .software => "gpu/software",
+            .unknown => "gpu/unknown",
+        };
     }
 
     pub fn adapterTypeName(self: AdapterInfo) []const u8 {
@@ -215,10 +296,9 @@ pub const AdapterInfo = struct {
             .adapter_type = @intCast(raw.adapterType),
             .backend_type = raw.backendType,
         };
-        const text = stringViewSlice(raw.description);
-        const len = @min(text.len, info.description_buf.len);
-        @memcpy(info.description_buf[0..len], text[0..len]);
-        info.description_len = @intCast(len);
+        copyString(raw.description, &info.description_buf, &info.description_len);
+        copyString(raw.vendor, &info.vendor_buf, &info.vendor_len);
+        copyString(raw.architecture, &info.architecture_buf, &info.architecture_len);
         return info;
     }
 };
@@ -237,6 +317,24 @@ pub fn backendTypeName(backend_type: wgpu.WGPUBackendType) []const u8 {
         wgpu.WGPUBackendType_OpenGLES => "opengles",
         else => "undefined",
     };
+}
+
+pub const AdapterKind = enum { discrete, integrated, software, unknown };
+
+fn copyString(view: wgpu.WGPUStringView, out: []u8, out_len: *u8) void {
+    const text = stringViewSlice(view);
+    const len = @min(text.len, out.len);
+    @memcpy(out[0..len], text[0..len]);
+    out_len.* = @intCast(len);
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
 }
 
 fn stringViewSlice(view: wgpu.WGPUStringView) []const u8 {
@@ -397,6 +495,7 @@ pub const GpuContext = struct {
         var adapter_state = AdapterRequestState{};
         var adapter_options = wgpu.WGPURequestAdapterOptions.initial;
         adapter_options.powerPreference = selection.preference.toWgpu();
+        adapter_options.forceFallbackAdapter = if (selection.force_fallback) 1 else 0;
         _ = wgpu.wgpuInstanceRequestAdapter(self.instance, &adapter_options, .{
             .nextInChain = null,
             .mode = wgpu.WGPUCallbackMode_AllowProcessEvents,
@@ -482,7 +581,7 @@ pub const GpuContext = struct {
     /// discoverable as part of `GpuContext` while the cache itself lives at
     /// module scope.
     pub fn probe() ProbeResult {
-        return probeCachedWith(adapterSelection().preference);
+        return probeCachedWith(adapterSelection());
     }
 
     /// Return whether this context can represent both the requested buffers
@@ -811,13 +910,13 @@ var default_selection: AdapterSelection = .{};
 /// One cached probe per `AdapterPreference` (3 slots).  Keeping them separate
 /// means an adapter ablation can open the iGPU and the dGPU in the same process
 /// without pulling the device out from under the first context.
-const adapter_slot_count = 3;
+const adapter_slot_count = 4;
 const ProbeSlot = struct {
     done: bool = false,
     result: ProbeResult = ProbeResult.unavailable(.not_probed),
     context: ?GpuContext = null,
 };
-var probe_slots: [adapter_slot_count]ProbeSlot = .{ .{}, .{}, .{} };
+var probe_slots: [adapter_slot_count]ProbeSlot = .{ .{}, .{}, .{}, .{} };
 
 var fallback_reason: ?[]const u8 = null;
 var fallback_mutex: std.atomic.Mutex = .unlocked;
@@ -840,14 +939,14 @@ fn failureForInitError(err: InitFailure) ProbeFailure {
 }
 
 fn probeLocked() ProbeResult {
-    return probeWithLocked(default_selection.preference);
+    return probeWithLocked(default_selection);
 }
 
 /// Probe (and keep) the context for one preference.  Called with `probe_mutex`
 /// held.  A successful probe stores the context in that preference's slot, which
 /// is what the void-API engine (`global()`) reads back.
-fn probeWithLocked(preference: AdapterPreference) ProbeResult {
-    const slot = &probe_slots[preference.slot()];
+fn probeWithLocked(selection: AdapterSelection) ProbeResult {
+    const slot = &probe_slots[selectionSlot(selection)];
     if (slot.done) return slot.result;
     if (probe_override_for_testing) |override| {
         slot.result = override;
@@ -855,10 +954,7 @@ fn probeWithLocked(preference: AdapterPreference) ProbeResult {
         return slot.result;
     }
 
-    const context = GpuContext.initDetailed(
-        std.heap.page_allocator,
-        .{ .preference = preference },
-    ) catch |err| {
+    const context = GpuContext.initDetailed(std.heap.page_allocator, selection) catch |err| {
         slot.result = ProbeResult.unavailable(failureForInitError(err));
         slot.done = true;
         return slot.result;
@@ -872,7 +968,8 @@ fn probeWithLocked(preference: AdapterPreference) ProbeResult {
         .limits = context.limits,
         .adapter_backend_type = context.adapter_backend_type,
         .adapter_vendor_id = context.adapter_vendor_id,
-        .preference = preference,
+        .preference = selection.preference,
+        .selection = selection,
         .adapter_info = context.adapter_info,
     };
     slot.done = true;
@@ -884,10 +981,10 @@ fn probeWithLocked(preference: AdapterPreference) ProbeResult {
 /// `global()`.  A successful probe owns the context used by subsequent GPU
 /// operations, so selection does not probe once and then silently initialize a
 /// different context later.
-fn probeCachedWith(preference: AdapterPreference) ProbeResult {
+fn probeCachedWith(selection: AdapterSelection) ProbeResult {
     lock(&probe_mutex);
     defer probe_mutex.unlock();
-    return probeWithLocked(preference);
+    return probeWithLocked(selection);
 }
 
 /// Set the adapter preference used by `probe()` / `global()` / the
@@ -922,7 +1019,7 @@ pub fn probe() ProbeResult {
 /// Probe a specific adapter preference without changing the process default.
 /// This is what an adapter ablation uses.
 pub fn probeWithAdapter(selection: AdapterSelection) ProbeResult {
-    return probeCachedWith(selection.preference);
+    return probeCachedWith(selection);
 }
 
 /// The comptime-dispatched engine has a void API, so its GPU implementation
@@ -932,8 +1029,8 @@ pub fn global() !*GpuContext {
     lock(&probe_mutex);
     defer probe_mutex.unlock();
 
-    const preferred = &probe_slots[default_selection.preference.slot()];
-    const result = if (preferred.context != null) preferred.result else probeWithLocked(default_selection.preference);
+    const preferred = &probe_slots[selectionSlot(default_selection)];
+    const result = if (preferred.context != null) preferred.result else probeWithLocked(default_selection);
     if (!result.available) {
         recordFallback(result.reason);
         return error.GpuError;
@@ -1040,6 +1137,60 @@ test "adapter info keeps its own copy of the description string" {
     try std.testing.expectEqualStrings("integrated", info.adapterTypeName());
 }
 
+test "adapter classification: driver type is authoritative, names are the fallback" {
+    const expect = std.testing.expect;
+
+    // ① 驱动填了 adapterType（native/wgpu-native 会填）：直接用，不猜
+    var discrete = AdapterInfo{ .adapter_type = wgpu.WGPUAdapterType_DiscreteGPU };
+    try expect(discrete.kind() == .discrete);
+    try expect(!discrete.isSoftware());
+    try expect(std.mem.eql(u8, discrete.pathLabel(), "gpu/discrete"));
+
+    var integrated = AdapterInfo{ .adapter_type = wgpu.WGPUAdapterType_IntegratedGPU };
+    try expect(integrated.kind() == .integrated);
+    try expect(std.mem.eql(u8, integrated.pathLabel(), "gpu/integrated"));
+
+    var cpu_type = AdapterInfo{ .adapter_type = wgpu.WGPUAdapterType_CPU };
+    try expect(cpu_type.kind() == .software);
+    try expect(cpu_type.isSoftware());
+    try expect(std.mem.eql(u8, cpu_type.pathLabel(), "gpu/software"));
+
+    // ② 驱动没填（**浏览器实测就是这样**：nvidia/amd 都报 Unknown，只有
+    //    SwiftShader 报 type=3）→ 退回到名字启发式
+    var browser_sw = AdapterInfo{};
+    setFixed(&browser_sw.vendor_buf, &browser_sw.vendor_len, "google");
+    setFixed(&browser_sw.architecture_buf, &browser_sw.architecture_len, "swiftshader");
+    try expect(browser_sw.kind() == .unknown); // 类型判不出来
+    try expect(browser_sw.isSoftware()); // 但名字能判出来
+    try expect(std.mem.eql(u8, browser_sw.pathLabel(), "gpu/software"));
+
+    var browser_amd = AdapterInfo{};
+    setFixed(&browser_amd.vendor_buf, &browser_amd.vendor_len, "amd");
+    setFixed(&browser_amd.architecture_buf, &browser_amd.architecture_len, "gcn-5");
+    try expect(!browser_amd.isSoftware()); // 不要误判硬件为软件
+    try expect(std.mem.eql(u8, browser_amd.pathLabel(), "gpu/unknown"));
+
+    var browser_nv = AdapterInfo{};
+    setFixed(&browser_nv.vendor_buf, &browser_nv.vendor_len, "nvidia");
+    setFixed(&browser_nv.architecture_buf, &browser_nv.architecture_len, "ampere");
+    try expect(!browser_nv.isSoftware());
+
+    // 大小写无关 + llvmpipe 这类别的软件实现
+    var llvmpipe = AdapterInfo{};
+    setFixed(&llvmpipe.description_buf, &llvmpipe.description_len, "llvmpipe (LLVM 22.1.8, 256 bits)");
+    try expect(llvmpipe.isSoftware());
+
+    // 选择项的标签（消融表用）
+    try expect(std.mem.eql(u8, (AdapterSelection{}).label(), "auto"));
+    try expect(std.mem.eql(u8, (AdapterSelection{ .preference = .high_performance }).label(), "high-performance"));
+    try expect(std.mem.eql(u8, (AdapterSelection{ .force_fallback = true }).label(), "fallback(software)"));
+}
+
+fn setFixed(buf: []u8, len: *u8, text: []const u8) void {
+    @memcpy(buf[0..text.len], text);
+    len.* = @intCast(text.len);
+}
+
 test "adapter preference maps to the WebGPU power preference" {
     try std.testing.expectEqual(
         wgpu.WGPUPowerPreference_Undefined,
@@ -1079,15 +1230,22 @@ test "probeWithAdapter reports which adapter each preference selected" {
         try std.testing.expect(fast.failure != .not_probed);
     }
 
+    const software = probeWithAdapter(.{ .force_fallback = true });
     std.debug.print(
-        "\n[adapter] auto: {s} [{s}] | high-perf: {s} [{s}]\n",
+        "\n[adapter] auto: {s} → {s} | high-perf: {s} → {s} | fallback: {s} → {s}\n",
         .{
             if (auto.available) auto.adapter_info.description() else auto.reason,
-            if (auto.available) auto.adapter_info.adapterTypeName() else "-",
+            if (auto.available) auto.adapter_info.pathLabel() else "-",
             if (fast.available) fast.adapter_info.description() else fast.reason,
-            if (fast.available) fast.adapter_info.adapterTypeName() else "-",
+            if (fast.available) fast.adapter_info.pathLabel() else "-",
+            if (software.available) software.adapter_info.description() else software.reason,
+            if (software.available) software.adapter_info.pathLabel() else "-",
         },
     );
+    // 软件 fallback 槽独立缓存：探过之后不影响前两个槽
+    try std.testing.expectEqual(AdapterPreference.auto, auto.preference);
+    try std.testing.expectEqual(AdapterPreference.high_performance, fast.preference);
+    try std.testing.expect(software.selection.force_fallback);
 
     // Two preferences, two live contexts: the earlier one must stay usable.
     if (auto.available and fast.available) {

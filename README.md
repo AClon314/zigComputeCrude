@@ -212,7 +212,15 @@ zig build run -- --kernel reduce --size 16777216 --op sum --precision fast
 判据在计时区**之外**，所以档位不影响测得的 kernel 时间（实测三档 gemm 512³ 为
 202.8 / 202.6 / 203.5 GFLOP/s，属噪声）——"游戏要快"的收益来自 adapter 与链式，不是放宽判据。
 
-`--adapter auto|high-perf|low-power` 是 **init-time** 开关，必须早于任何 GPU 调用；
+`--adapter auto|high-perf|low-power|fallback` 是 **init-time** 开关，必须早于任何 GPU 调用；
+`fallback` 请求实现的软件适配器（native = Mesa llvmpipe，浏览器 = SwiftShader），用来验证
+"软件适配器上也能跑对"；`AdapterSelection{ .force_fallback = true }` 是库侧对应写法。
+`probe().adapter_info` 现在带 `vendor/architecture/description/adapter_type`，并提供
+`kind()` / `isSoftware()` / `pathLabel()`（`gpu/discrete|integrated|software|unknown`）。
+**分类能力有边界**：native 侧驱动会填 `adapterType`，三种都能判；浏览器侧 emdawnwebgpu
+实测 nvidia/amd 都报 `Unknown`（只有 SwiftShader 报 `cpu`），所以浏览器里 iGPU/dGPU
+只能靠"请求偏好 + vendor/arch"推断，软件适配器则能可靠判定（见 `docs/zig-gpu-spike.md` §5.4）。
+
 每个偏好各自缓存一个 context（可以同一进程里跑两种 adapter 对比，见下面消融）。
 库消费者用 `computeAccel.setAdapterSelection(.{ .preference = .high_performance })`
 （或 `GpuContext.initWithAdapter`）；`probe().adapter_info.description()`

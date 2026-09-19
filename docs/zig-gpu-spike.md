@@ -190,6 +190,23 @@ host 运行时（Buffer/Kernel/Chain）、对拍契约、以及 spatial 这类�
 `--kernel reduce --size 16777216`：iGPU 19.8 GB/s vs dGPU 19.9 GB/s —— **无差别**，
 因为这条路径是"1 次上传 + 5 次归约 + 1 次回读"的搬运主导，换 GPU 不改 PCIe 带宽。
 
+### 5.4 分类能力：iGPU / dGPU / 软件适配器能不能判出来（2026-09-19 实测）
+
+| 侧 | iGPU vs dGPU | 软件适配器 | 依据 |
+|---|---|---|---|
+| native (wgpu-native v29) | ✅ `adapterType` = Integrated / Discrete | ✅ `adapterType` = CPU（llvmpipe，`vendorID=0x10005`） | 驱动填 `WGPUAdapterInfo.adapterType`；`vendorID/deviceID` 也有 |
+| 浏览器 (emdawnwebgpu) | ❌ 两者都报 `type=4`(Unknown)，`vendorID/deviceID=0` | ✅ 只有 fallback 报 `type=3`(CPU)；名字启发式（swiftshader/llvmpipe/…）兜底 | `adapter.info` 只给 vendor/architecture（description/device 为空，隐私）；`isFallbackAdapter` 本机实测恒为 false，**不可依赖** |
+
+对应 API：`AdapterInfo.kind()` / `isSoftware()` / `pathLabel()`；`AdapterSelection.force_fallback`
+（native 与浏览器都支持请求软件适配器）。本机四种选择的实测结果：
+
+```
+auto               → gpu/integrated  Mesa 26.1.8 [integrated] vendor=0x1002 device=0x1638
+high-performance   → gpu/discrete    610.57.04 [discrete]     vendor=0x10de device=0x25e2
+low-power          → gpu/integrated  Mesa 26.1.8 [integrated]
+fallback(software) → gpu/software    Mesa 26.1.8 (LLVM 22.1.8) [cpu] vendor=0x10005
+```
+
 ### 5.3 结论与建议（已实现，见 README「adapter 消融」）
 
 > 状态：2026-09-19 已实现。浏览器侧也补齐了：`shell.html` 用四种请求
