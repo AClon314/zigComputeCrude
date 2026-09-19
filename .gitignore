@@ -6,3 +6,6 @@ __pycache__/
 *.pyc
 # 交接文档只做本地工作日志，不入库（*handoff*）
 *handoff*
+
+# 本地 playground（不进库）
+tmp/

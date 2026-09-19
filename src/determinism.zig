@@ -112,10 +112,17 @@ pub fn crossVendorReproducible(comptime class: Class) bool {
 }
 
 pub const Comparison = struct {
+    /// 最大绝对差；**忽略 NaN**（`@max` 在 NaN 上返回另一个操作数，会掩盖问题）。
     max_diff: f64,
     scale: f64,
     tolerance: Tolerance,
     within: bool,
+    /// 逐元素判据失败的个数。`within` 等价于 `mismatches == 0`。
+    mismatches: usize,
+    /// 其中因为 NaN 而失败的个数（|NaN - x| = NaN，永远不满足任何容差）。
+    /// 单独计数是因为它能让 `max_diff` 看起来是 0 却判定失败——这个组合曾经
+    /// 让一个 demo 的"diff=0 但 MISMATCH"看起来像判据坏了。
+    nan_mismatches: usize,
 
     pub fn limit(self: Comparison) f64 {
         return self.tolerance.limit(self.scale);
@@ -135,19 +142,29 @@ pub fn compareF32(
     const tol = tolerance(precision, class);
     var max_diff: f64 = 0;
     var scale: f64 = 0;
-    var within = true;
+    var mismatches: usize = 0;
+    var nan_mismatches: usize = 0;
     for (expected, actual) |e, a| {
         const ef: f64 = e;
-        const diff = @abs(ef - @as(f64, a));
-        max_diff = @max(max_diff, diff);
+        const af: f64 = a;
         scale = @max(scale, @abs(ef));
-        within = within and tol.within(diff, @abs(ef));
+        const diff = @abs(ef - af);
+        if (std.math.isNan(diff)) {
+            // NaN 与任何值（包括 NaN）都不算通过：对拍时它多半是数据坏了。
+            nan_mismatches += 1;
+            mismatches += 1;
+            continue;
+        }
+        max_diff = @max(max_diff, diff);
+        if (!tol.within(diff, @abs(ef))) mismatches += 1;
     }
     return .{
         .max_diff = max_diff,
         .scale = scale,
         .tolerance = tol,
-        .within = within,
+        .within = mismatches == 0,
+        .mismatches = mismatches,
+        .nan_mismatches = nan_mismatches,
     };
 }
 
@@ -159,13 +176,18 @@ pub fn compareScalarF32(
     actual: f32,
 ) Comparison {
     const tol = tolerance(precision, class);
-    const max_diff: f64 = @abs(@as(f64, expected) - @as(f64, actual));
-    const scale: f64 = @abs(@as(f64, expected));
+    const ef: f64 = expected;
+    const diff: f64 = @abs(ef - @as(f64, actual));
+    const scale: f64 = @abs(ef);
+    const is_nan = std.math.isNan(diff);
+    const ok = !is_nan and tol.within(diff, scale);
     return .{
-        .max_diff = max_diff,
+        .max_diff = if (is_nan) 0 else diff,
         .scale = scale,
         .tolerance = tol,
-        .within = tol.within(max_diff, scale),
+        .within = ok,
+        .mismatches = if (ok) 0 else 1,
+        .nan_mismatches = if (is_nan) 1 else 0,
     };
 }
 
@@ -342,6 +364,29 @@ test "explicit tolerance keeps a tighter internal gate" {
         error.TestExpectedApproxEq,
         expectSlicesWithin(.{ .absolute = 1e-5, .relative = 1e-5 }, f32, &expected, &off_by_loose),
     );
+}
+
+test "NaN is reported explicitly instead of hiding behind max_diff = 0" {
+    const expected = [_]f32{ 1.0, 2.0, 3.0 };
+    const has_nan = [_]f32{ 1.0, std.math.nan(f32), 3.0 };
+    const comparison = compareF32(.tolerant, .accumulated, &expected, &has_nan);
+
+    try std.testing.expect(!comparison.within);
+    try std.testing.expectEqual(@as(usize, 1), comparison.mismatches);
+    try std.testing.expectEqual(@as(usize, 1), comparison.nan_mismatches);
+    // max_diff 保持有限：NaN 不该悄悄消失，也不该把整个统计变成 NaN。
+    try std.testing.expect(comparison.max_diff == 0);
+
+    // NaN vs NaN 也算不通过（对拍场景下"两边都是 NaN"更可能是坏数据）。
+    const both_nan = [_]f32{ std.math.nan(f32) };
+    const nan_vs_nan = compareF32(.tolerant, .accumulated, &both_nan, &both_nan);
+    try std.testing.expect(!nan_vs_nan.within);
+    try std.testing.expectEqual(@as(usize, 1), nan_vs_nan.nan_mismatches);
+
+    // 正常路径不被影响。
+    const same = compareF32(.tolerant, .accumulated, &expected, &expected);
+    try std.testing.expect(same.within);
+    try std.testing.expectEqual(@as(usize, 0), same.mismatches);
 }
 
 test "scalar comparison and length mismatch" {
