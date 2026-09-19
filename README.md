@@ -9,6 +9,7 @@
 - 开发与贡献规则：`AGENTS.md`
 - 架构与后续路线（Blender 节点系统迁移评估）：`docs/node-system-migration.md`
 - 依赖说明：`deps/README.md`
+- GPU 选型与生态核查：`docs/gpu-backend-research.md`、`docs/zig-gpu-spike.md`（Zig 当 kernel 语言的实测否决）
 
 ---
 
@@ -190,6 +191,11 @@ zig build run -- --kernel chain --chain pipeline --m 512 --k 512 --n 512 --chain
 
 环境：AMD Ryzen 5 5600H + Radeon Vega iGPU（RADV/Vulkan），ReleaseFast，
 机器非独占（CPU 行有 ±10% 波动）。所有 GPU 结果都与 CPU 参考逐元素对拍，`max|diff|` 见各表说明。
+
+> 注：本机还有一块 RTX 3050 Laptop（Vulkan 可见），但当前 `wgpuInstanceRequestAdapter` 传
+> `options = NULL`，默认总是选到 iGPU；同一二进制改选 dGPU 后 GEMM 约 1.4~2.0x、链式相对
+> 分步的优势 1.39x → **2.69x**（reduce 因搬运主导而无差别）。见 `docs/zig-gpu-spike.md` §5；
+> 下表仍是 iGPU 数字，adapter 选择与 dGPU 回填待做（同文档 §7）。
 
 ### M0 消融：saxpy 链（16 MiB/buffer，超过 L3；GB/s 计 3 条流：读 x、读 y、写 x）
 

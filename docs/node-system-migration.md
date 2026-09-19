@@ -98,7 +98,7 @@
 | 异步 / 重叠 | ❌ readback 阻塞自旋 pump（30s 墙钟超时） | `GpuContext.waitFor/readBuffer` |
 | 计时 / 诊断 | ⚠️ 无 GPU timestamp；错误只回 `GpuError`（wgpu message 被丢） | `context.zig` 的 error scope |
 | 能力探测 / 回退 | ✅ probe + limits 闸门 + 诚实回退（可提炼为"能力矩阵"） | `context.zig` / `backend.zig` / `bench.zig` |
-| 一绑定两目标 + ABI 护栏 | ✅ 31 符号子集 + drift check（**核心资产**） | `tools/check_abi_drift.sh` |
+| 一绑定两目标 + ABI 护栏 | ✅ 32 符号子集 + drift check（**核心资产**） | `tools/check_abi_drift.sh` |
 | 正确性方法论 | ✅ CPU 参考 + `max|diff|` + 明确容差 | 各 kernel 的测试与 CLI |
 | 已验证 GPU 模式 | ✅ 2D dispatch 展平、workgroup 内存、两趟归约、tiled GEMM | `handoff.md` / README 实测 |
 
@@ -216,7 +216,7 @@
 | 着色器翻译（未来非浏览器路径） | naga / SPIRV-Cross / Tint | 只有放弃浏览器时才值得引入 |
 | 图形/游戏框架 | `zig-gamedev`（zgpu/zmath/zmesh，Dawn 系）、`mach` | 图形向、依赖重、版本churn 大；不解决 compute 原语，不建议引入 |
 | GPU 绑定（wgpu-native 的 Zig 侧） | `raugl/wgpu-zig`、`xiexingwu/wgpu-zig` 等（0~1★，2025~2026） | **仅作参考**：桌面-only（无 `wasm32-emscripten` 目标）、纯绑定无 runtime/对拍；只有放弃浏览器时才评估（§5.6） |
-| Zig `std.gpu`（0.16 起自带） | Zig 官方 std | **不进基线**：SPIR-V 侧 intrinsic（`.spirv_kernel` cc），非 host 绑定、不产出 WGSL → native-only（§5.6） |
+| Zig `std.gpu`（0.16 起自带） | Zig 官方 std | **不进基线**：SPIR-V 侧 intrinsic（`.spirv_kernel` cc），非 host 绑定、不产出 WGSL → native-only（§5.6/§5.7） |
 
 直白说：**"原语层"是这个项目的自研职责，也是它存在的意义**；能外包的只有
 CPU 参考实现、编解码、色彩、去噪这些"领域 C/C++ 库"，以及未来的 shader 翻译。
@@ -260,7 +260,26 @@ S1 的均匀网格与 scan/compaction 确实没有先例。两个可执行结论
    只吃 WGSL → 会破坏"一绑定两目标"。归类与 `naga / Tint` 相同：放弃浏览器时才考虑。
 2. **`mach-gpu` 的停摆既是反面教材也是支撑**：三个 WebGPU 项目一起进 graveyard，说明这个
    方向"看着有人做过、实际都停摆"，死因是图形向依赖 churn + Dawn 跨编译维护成本；本项目用
-   "预编译 wgpu-native + emdawnwebgpu + 只碰 31 符号手写子集 + `check_abi_drift.sh`"规避了它。
+   "预编译 wgpu-native + emdawnwebgpu + 只碰 32 符号手写子集 + `check_abi_drift.sh`"规避了它。
+
+### 5.7 Zig 当 kernel 语言（`std.gpu` / SPIR-V / PTX / AMDGCN）：实测否决
+
+**结论：不引入，保持 WGSL 单一定义。** 完整实测（命令、原始输出、规范引用）见
+[`docs/zig-gpu-spike.md`](zig-gpu-spike.md)，四条硬理由：
+
+1. 现行 WebGPU 规范**不含 SPIR-V**（`GPUShaderModule` 只吃 WGSL 文本）→ Zig 的三条产出
+   路线（SPIR-V/PTX/AMDGCN）**没有一条能进浏览器**；
+2. "SPIR-V → naga → WGSL"也无法中转：Zig 输出用 `PhysicalStorageBuffer64` +
+   `PhysicalStorageBufferAddresses`，而 naga 的 `SUPPORTED_CAPABILITIES` 里没有这一项；
+3. `std.gpu` 只有 shader 侧 builtin，**没有 host API**（device/queue/pipeline/buffer/mapping）
+   → 我们的 `runtime/` 那一层依然无人提供（同 §5.6）；
+4. 工具链未成熟：0.16.0 下 `std.gpu.executionMode()` 发不出 `OpExecutionMode`（assembler 直接
+   拒绝）、`@atomicRmw` 是 TODO、`addrspace(.shared)` 让编译器 panic、PTX 目标 `LLVM ERROR`
+   core dump、AMDGCN 在 `@workGroupId(0) * @workGroupSize(0)` 上 panic。
+
+保留的**接缝**：`runtime.Kernel` 的签名 `(shader_code, entry, bindings, workgroup_size)` 本身
+前端无关；新前端准入条件（必须产 WGSL / 不用 PhysicalStorageBuffer / 支持 workgroup 内存 +
+barrier + 整数 atomic / 能显式声明 binding 布局）写在 spike 文档 §4.2。
 
 ---
 
@@ -412,8 +431,16 @@ GEMM→bias→reduce 异质链，结果与 CPU 参考对拍。`backends/`、`pri
 
 - WGSL 的 `sin/cos/pow/exp` 由驱动实现，不同 GPU 结果可差几个 ulp；
   FMA 收缩、归约求和顺序、纹理过滤、denormal 处理都会造成差异；
+- 两处**规范依据**（2026-09-19 核对现行 WGSL 规范，详见 `docs/zig-gpu-spike.md` §6）：
+  §15.7.5 明确允许实现**重结合与融合**（"An implementation may reassociate operations."），
+  §17.5.32 的 `fma` 精度是"继承自 `x * y + z`"（**不保证真融合**）——即含乘加的 f32 kernel
+  在 WGSL 上**无法**跨厂商做到 bit 一致，容差契约是必需的，而不是可以放松的；
 - 对策：定义三档模式 `exact`（同后端可复现）/**`tolerant`（默认，逐算子容差表）**/`fast`；
   对"会改变控制流"的计算（散射采样、哈希、排序键）强制用整数/哈希运算，保证跨后端一致；
+- **门禁分级（建议立刻收紧）**：整数/索引类（scan 的偏移、compaction 的索引、均匀网格
+  cell/桶下标、k=16 邻接表）用**精确相等（`== 0`）**比，不给容差；只有 f32 流式/累加类
+  用相对容差（现有 1e-4）。整数 `atomicAdd` 的计数/槽位分配是顺序无关的，所以网格构建
+  天然落在精确档，应当写成断言而不是"看起来对"；
 - 测试基建：把现有"CPU 参考 + `max|diff|`"扩成"同一 IR 跑所有后端对拍"。
 
 ### 7.2 外部库与语义覆盖

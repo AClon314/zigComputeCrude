@@ -63,7 +63,7 @@
 | 维度 | `std.gpu` | wgpu-native + emdawnwebgpu（本项目现状） |
 |---|---|---|
 | 层 | shader 语言层（SPIR-V） | host 绑定层（C ABI） |
-| host API（buffer/pipeline/dispatch） | 无 | 有（手写 31 符号子集） |
+| host API（buffer/pipeline/dispatch） | 无 | 有（手写 32 符号子集） |
 | 浏览器 WebGPU | ❌（浏览器只收 WGSL） | ✅（emdawnwebgpu 同形 ABI） |
 | 与 CPU 参考对拍 | 需自建，且目标只有 native | 已有，同一定义双后端 |
 
