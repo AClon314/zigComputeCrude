@@ -217,9 +217,16 @@ zig build run -- --kernel reduce --size 16777216 --op sum --precision fast
 "软件适配器上也能跑对"；`AdapterSelection{ .force_fallback = true }` 是库侧对应写法。
 `probe().adapter_info` 现在带 `vendor/architecture/description/adapter_type`，并提供
 `kind()` / `isSoftware()` / `pathLabel()`（`gpu/discrete|integrated|software|unknown`）。
-**分类能力有边界**：native 侧驱动会填 `adapterType`，三种都能判；浏览器侧 emdawnwebgpu
-实测 nvidia/amd 都报 `Unknown`（只有 SwiftShader 报 `cpu`），所以浏览器里 iGPU/dGPU
-只能靠"请求偏好 + vendor/arch"推断，软件适配器则能可靠判定（见 `docs/zig-gpu-spike.md` §5.4）。
+**分类能力有边界，所以 `pathLabel()` 对外只给二分 `gpu/hardware` / `gpu/software`**：
+native 侧驱动会填 `adapterType`（discrete/integrated/cpu 都可判），但浏览器侧既判不出
+iGPU/dGPU（emdawnwebgpu 报 `Unknown`，只有 SwiftShader 报 `cpu`）**也选不了**——页面内
+`powerPreference` 只是偏好，实测启动参数同样控不住 Dawn（`--render-node-override` 对 WebGPU
+无效；`--force_low_power_gpu` 或 `VK_ICD_FILENAMES=<单 ICD>` 会把整个浏览器打到 SwiftShader）。
+需要细分时读 `kind()` / `adapterTypeName()`（诊断用，不是可选项）；完整实测见
+`docs/zig-gpu-spike.md` §5.4。
+
+> 调试用 Chrome 见 `~/bin/chrome-webgpu`：启动前自动关掉旧实例（每个实例的 gpu-process
+> 可烧 2~4 核），并支持 `--probe` 打印四种请求实际拿到哪块适配器。
 
 每个偏好各自缓存一个 context（可以同一进程里跑两种 adapter 对比，见下面消融）。
 库消费者用 `computeAccel.setAdapterSelection(.{ .preference = .high_performance })`

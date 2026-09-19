@@ -264,16 +264,18 @@ pub const AdapterInfo = struct {
         return false;
     }
 
-    /// 给日志/CLI 用的一行式路径标签：`gpu/discrete`、`gpu/integrated`、
-    /// `gpu/software` 或 `gpu/unknown`。
+    /// 给日志/CLI 用的一行式**可行动**路径标签：`gpu/hardware` 或 `gpu/software`。
+    ///
+    /// 为什么不细分 iGPU/dGPU：**只有 native 侧能可靠区分**，而且调用方也几乎无法
+    /// "选到指定那块"——浏览器里 `powerPreference` 只是偏好，页面无法指定物理卡；
+    /// 实测连启动参数都控不住 Dawn（`--render-node-override` 对 WebGPU 无效、
+    /// `--force_low_power_gpu`/`VK_ICD_FILENAMES=<单 ICD>` 会把整个浏览器打到
+    /// SwiftShader）。所以对外只给"硬件加速 / 软件适配器"这个真正可用得上的二分；
+    /// 想看驱动给的细分（discrete/integrated）用 `kind()` / `adapterTypeName()`，
+    /// 那是诊断信息，不是可选项。
     pub fn pathLabel(self: *const AdapterInfo) []const u8 {
         if (self.isSoftware()) return "gpu/software";
-        return switch (self.kind()) {
-            .discrete => "gpu/discrete",
-            .integrated => "gpu/integrated",
-            .software => "gpu/software",
-            .unknown => "gpu/unknown",
-        };
+        return "gpu/hardware";
     }
 
     pub fn adapterTypeName(self: AdapterInfo) []const u8 {
@@ -1142,13 +1144,13 @@ test "adapter classification: driver type is authoritative, names are the fallba
 
     // ① 驱动填了 adapterType（native/wgpu-native 会填）：直接用，不猜
     var discrete = AdapterInfo{ .adapter_type = wgpu.WGPUAdapterType_DiscreteGPU };
-    try expect(discrete.kind() == .discrete);
+    try expect(discrete.kind() == .discrete); // 细分仍可从驱动拿到（诊断用）
     try expect(!discrete.isSoftware());
-    try expect(std.mem.eql(u8, discrete.pathLabel(), "gpu/discrete"));
+    try expect(std.mem.eql(u8, discrete.pathLabel(), "gpu/hardware")); // 对外只二分
 
     var integrated = AdapterInfo{ .adapter_type = wgpu.WGPUAdapterType_IntegratedGPU };
     try expect(integrated.kind() == .integrated);
-    try expect(std.mem.eql(u8, integrated.pathLabel(), "gpu/integrated"));
+    try expect(std.mem.eql(u8, integrated.pathLabel(), "gpu/hardware"));
 
     var cpu_type = AdapterInfo{ .adapter_type = wgpu.WGPUAdapterType_CPU };
     try expect(cpu_type.kind() == .software);
@@ -1168,7 +1170,7 @@ test "adapter classification: driver type is authoritative, names are the fallba
     setFixed(&browser_amd.vendor_buf, &browser_amd.vendor_len, "amd");
     setFixed(&browser_amd.architecture_buf, &browser_amd.architecture_len, "gcn-5");
     try expect(!browser_amd.isSoftware()); // 不要误判硬件为软件
-    try expect(std.mem.eql(u8, browser_amd.pathLabel(), "gpu/unknown"));
+    try expect(std.mem.eql(u8, browser_amd.pathLabel(), "gpu/hardware")); // 判不出细分也算硬件
 
     var browser_nv = AdapterInfo{};
     setFixed(&browser_nv.vendor_buf, &browser_nv.vendor_len, "nvidia");

@@ -197,6 +197,19 @@ host 运行时（Buffer/Kernel/Chain）、对拍契约、以及 spatial 这类�
 | native (wgpu-native v29) | ✅ `adapterType` = Integrated / Discrete | ✅ `adapterType` = CPU（llvmpipe，`vendorID=0x10005`） | 驱动填 `WGPUAdapterInfo.adapterType`；`vendorID/deviceID` 也有 |
 | 浏览器 (emdawnwebgpu) | ❌ 两者都报 `type=4`(Unknown)，`vendorID/deviceID=0` | ✅ 只有 fallback 报 `type=3`(CPU)；名字启发式（swiftshader/llvmpipe/…）兜底 | `adapter.info` 只给 vendor/architecture（description/device 为空，隐私）；`isFallbackAdapter` 本机实测恒为 false，**不可依赖** |
 
+**浏览器选卡：连启动参数都控不住（2026-09-19 实测，Chrome 154 beta）**
+
+| 手段 | 期望 | 实测 |
+|---|---|---|
+| 页面 `powerPreference` | 偏好 | `auto`/`high-performance` → nvidia ampere；`low-power` → amd gcn-5（**只是偏好**，页面无法指定物理卡） |
+| `--render-node-override=/dev/dri/renderD128\|129` + `--use-angle=vulkan`（`DefaultANGLEVulkan,VulkanFromANGLE`） | 指定哪块卡 | **对 WebGPU 无效**：`auto` 仍给 nvidia（ANGLE 是 GL 路径，Dawn 不走它） |
+| `--force_low_power_gpu` | 强制低功耗 | **全部变 SwiftShader**（软件，gpu-process 烧 ~4 核） |
+| `VK_ICD_FILENAMES=<只留一个 ICD>` | 只暴露一块卡 | **全部变 SwiftShader**（GPU 进程放弃硬件） |
+| `--use-webgpu-adapter=swiftshader` | 指定 Dawn 后端 | 进程异常退出（该 flag 已失效） |
+
+结论：浏览器侧唯一可行动的区分就是 **hardware / software**，因此 `pathLabel()` 合并 iGPU/dGPU；
+"要指定某块卡"只能走 native（wgpu-native + `AdapterSelection`）。
+
 对应 API：`AdapterInfo.kind()` / `isSoftware()` / `pathLabel()`；`AdapterSelection.force_fallback`
 （native 与浏览器都支持请求软件适配器）。本机四种选择的实测结果：
 
