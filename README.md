@@ -180,10 +180,21 @@ zig build run -- --kernel spatial --points 262144 --queries 4096 --radius 2.0 --
 # M0 消融：常驻 + 链式（per_call / per_submit / chained × 链长）
 zig build run -- --kernel chain --chain saxpy --size 4194304 --chain-lens 1,4,16,64 --iters 3
 zig build run -- --kernel chain --chain pipeline --m 512 --k 512 --n 512 --chain-lens 1,4,16
+
+# WebGPU adapter 选择（init-time 开关；默认 auto 不一定是独显）
+zig build run -- --kernel gemm --m 1024 --k 1024 --n 1024 --adapter high-perf
+zig build run -- --kernel chain --chain pipeline --chain-lens 64 --iters 10 --adapter auto
+zig build run -- --kernel reduce --size 16777216 --adapter low-power
 ```
 
 `--kernel chain --chain pipeline` 跑的是 **GEMM → bias → reduce** 四段异质链
 （三种不同内核、两种输出形状），用于验证多内核依赖顺序与"一次提交"。
+
+`--adapter auto|high-perf|low-power` 是 **init-time** 开关，必须早于任何 GPU 调用；
+每个偏好各自缓存一个 context（可以同一进程里跑两种 adapter 对比，见下面消融）。
+库消费者用 `computeAccel.setAdapterSelection(.{ .preference = .high_performance })`
+（或 `GpuContext.initWithAdapter`）；`probe().adapter_info.description()`
+可拿到实际选中的卡名。浏览器端对应 `shell.html?power=high-perf`（同时转给 C ABI 侧）。
 
 ---
 
@@ -192,10 +203,28 @@ zig build run -- --kernel chain --chain pipeline --m 512 --k 512 --n 512 --chain
 环境：AMD Ryzen 5 5600H + Radeon Vega iGPU（RADV/Vulkan），ReleaseFast，
 机器非独占（CPU 行有 ±10% 波动）。所有 GPU 结果都与 CPU 参考逐元素对拍，`max|diff|` 见各表说明。
 
-> 注：本机还有一块 RTX 3050 Laptop（Vulkan 可见），但当前 `wgpuInstanceRequestAdapter` 传
-> `options = NULL`，默认总是选到 iGPU；同一二进制改选 dGPU 后 GEMM 约 1.4~2.0x、链式相对
-> 分步的优势 1.39x → **2.69x**（reduce 因搬运主导而无差别）。见 `docs/zig-gpu-spike.md` §5；
-> 下表仍是 iGPU 数字，adapter 选择与 dGPU 回填待做（同文档 §7）。
+> 注：本机还有一块 RTX 3050 Laptop（Vulkan 可见），但 WebGPU 的默认 power preference
+> **不保证是独显**（本机默认落在 iGPU），所以每个 GPU 结果都会打印实际选中的 adapter；
+> `--adapter high-perf` 可切到独显，实测 GEMM 1.2~2.0x、链式优势从 1.34x 提到 **2.69x**
+> （reduce 因搬运主导而无差别）——见下面「adapter 消融」与 `docs/zig-gpu-spike.md` §5。
+
+### adapter 消融（ReleaseFast，同机同二进制，仅改 `--adapter`；3 次取代表值）
+
+同一台机器上两块 Vulkan 设备：iGPU = AMD Radeon (RADV RENOIR)，dGPU = NVIDIA RTX 3050 Laptop。
+每个 GPU demo 都会打印实际选中的 adapter（`[integrated|discrete, vulkan]`）。
+
+| 负载 | `--adapter auto`（落 iGPU） | `--adapter high-perf`（dGPU） | 倍数 |
+|---|---|---|---|
+| GEMM 512³ tiled | 171.3 GFLOP/s | 209.5 GFLOP/s | 1.22x |
+| GEMM 512³ tiled_batch | 223.4 GFLOP/s | 424.8 GFLOP/s | 1.90x |
+| GEMM 1024³ tiled | 194.7 GFLOP/s | 306.6 GFLOP/s | 1.57x |
+| GEMM 1024³ tiled_batch | 223.7 GFLOP/s | 445.0 GFLOP/s | 1.99x |
+| chain pipeline 64 reps（chained） | 197.4 GFLOP/s | **490.6 GFLOP/s** | 2.49x |
+| chain pipeline 64 reps（submit_cut） | 1.34x | **2.69x** | — |
+| reduce 16M sum（gpu_batch） | 20.6 GB/s | 19.9 GB/s | 0.97x（搬运主导） |
+
+结论：**链式（M0）的价值在独显上更大**（每次 submit+readback 往返更贵：iGPU 1.34x vs dGPU 2.69x），
+而在共享内存 iGPU 上测出的数字会低估它。所有对拍不变（GEMM `max|diff| = 0`，chain `rel 3.70e-6`）。
 
 ### M0 消融：saxpy 链（16 MiB/buffer，超过 L3；GB/s 计 3 条流：读 x、读 y、写 x）
 

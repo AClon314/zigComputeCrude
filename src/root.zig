@@ -27,6 +27,15 @@ pub const GpuContext = gpu_context.GpuContext;
 pub const GpuLimits = gpu_context.GpuLimits;
 pub const ProbeFailure = gpu_context.ProbeFailure;
 pub const ProbeResult = gpu_context.ProbeResult;
+/// Adapter selection is an init-time switch: set it before the first GPU use
+/// with `gpu_context.setAdapterSelection`, or construct an explicit context with
+/// `GpuContext.initWithAdapter`.
+pub const AdapterPreference = gpu_context.AdapterPreference;
+pub const AdapterSelection = gpu_context.AdapterSelection;
+pub const AdapterInfo = gpu_context.AdapterInfo;
+pub const setAdapterSelection = gpu_context.setAdapterSelection;
+pub const backendTypeName = gpu_context.backendTypeName;
+pub const probeWithAdapter = gpu_context.probeWithAdapter;
 
 /// Compatibility helper retained for the Task 1 CLI template.
 pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {

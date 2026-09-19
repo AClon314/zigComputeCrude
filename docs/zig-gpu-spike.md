@@ -187,7 +187,15 @@ host 运行时（Buffer/Kernel/Chain）、对拍契约、以及 spatial 这类�
 `--kernel reduce --size 16777216`：iGPU 19.8 GB/s vs dGPU 19.9 GB/s —— **无差别**，
 因为这条路径是"1 次上传 + 5 次归约 + 1 次回读"的搬运主导，换 GPU 不改 PCIe 带宽。
 
-### 5.3 结论与建议
+### 5.3 结论与建议（已实现，见 README「adapter 消融」）
+
+> 状态：2026-09-19 已实现。`AdapterPreference{auto,high_performance,low_power}` +
+> `AdapterSelection` + `setAdapterSelection`（init-time 开关）+ `GpuContext.initWithAdapter`；
+> `probe()` 透出 `adapter_info`（description / adapterType / vendorID / deviceID / backendType），
+> 每个偏好各缓存一个 context（同一进程可跑两种 adapter 对比）；CLI `--adapter`；
+> 浏览器端 `shell.html?power=high-perf` 并把同一偏好转给 C ABI（`ca_wasm_set_adapter_preference`
+> 在 `Module.preRun` 里设置，因为 `ca_wasm_main()` 在 main 阶段就请求 adapter）。
+> 下面的 LD_PRELOAD 数字是**实现前**的探针数据；实现后用 `--adapter` 复测的数字在 README。
 
 1. **链式（M0）的价值被 iGPU 低估**：iGPU 上 1.39x、dGPU 上 2.69x —— 因为 dGPU 的
    每次 submit+readback 往返更贵。README/§4 的旗舰数字应补一行 dGPU 实测。
@@ -233,8 +241,10 @@ host 运行时（Buffer/Kernel/Chain）、对拍契约、以及 spatial 这类�
 
 ## 7. 后续动作（按 性价比 排序）
 
-1. **（做）adapter 选择 + probe 透出 adapter 信息**，加 `--adapter {auto|high-perf|low-power}`
-   消融；回填 README 的 dGPU 数字（含"链式优势 2.69x vs 1.39x"这一条）。
+1. ~~**（做）adapter 选择 + probe 透出 adapter 信息**，加 `--adapter {auto|high-perf|low-power}`
+   消融；回填 README 的 dGPU 数字（含"链式优势 2.69x vs 1.34x"这一条）。~~ **已完成**（2026-09-19）：
+   `--adapter` + `probe().adapter_info` + 每偏好一个 context + README「adapter 消融」表；
+   ABI 检查同时扩到「struct 字段清单 + 硬编码常量值」（`check_abi_drift.sh`）。
 2. **（做）确定性分级门禁**：把整数/索引类断言从"容差"改为"精确相等"，写入 §7.1 与测试。
 3. **（写）把本文件作为"新前端准入条件"的依据**，链到 `node-system-migration.md` §5.6 / §7.1。
 4. **（可选）给 Zig 上游报告两个崩溃**（都是最小复现，5 行以内）：

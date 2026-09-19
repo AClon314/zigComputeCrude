@@ -366,6 +366,23 @@ fn mapCallback(
     self.compare();
 }
 
+/// Adapter preference for the browser path, set by the page before
+/// `ca_wasm_main` runs (0 = auto/default, 1 = high-performance, 2 = low-power).
+///
+/// The page already chooses an adapter for `preinitializedWebGPUDevice`; passing
+/// the same preference here keeps the C-ABI request from landing on a *different*
+/// GPU on a hybrid laptop (browsers default to low-power, i.e. the integrated
+/// one).  See docs/zig-gpu-spike.md §5.
+var wasm_adapter_preference: wgpu.WGPUPowerPreference = wgpu.WGPUPowerPreference_Undefined;
+
+export fn ca_wasm_set_adapter_preference(preference: u32) void {
+    wasm_adapter_preference = switch (preference) {
+        1 => wgpu.WGPUPowerPreference_HighPerformance,
+        2 => wgpu.WGPUPowerPreference_LowPower,
+        else => wgpu.WGPUPowerPreference_Undefined,
+    };
+}
+
 /// Called by the C main() once the emcc module starts.
 export fn ca_wasm_main() void {
     if (runner.started) return;
@@ -404,7 +421,9 @@ export fn ca_wasm_main() void {
         return;
     };
     setStatus("loading: WebGPU adapter");
-    _ = wgpu.wgpuInstanceRequestAdapter(runner.instance, null, .{
+    var adapter_options = wgpu.WGPURequestAdapterOptions.initial;
+    adapter_options.powerPreference = wasm_adapter_preference;
+    _ = wgpu.wgpuInstanceRequestAdapter(runner.instance, &adapter_options, .{
         .nextInChain = null,
         .mode = wgpu.WGPUCallbackMode_AllowProcessEvents,
         .callback = adapterCallback,

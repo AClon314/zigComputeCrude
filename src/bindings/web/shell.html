@@ -128,9 +128,32 @@
                 return;
             }
 
+            // ?power=high-perf|low-power|auto — browsers default to low-power,
+            // which on a hybrid laptop means the integrated GPU.  The same
+            // preference is forwarded to the Zig side (ca_wasm_set_adapter_preference)
+            // so both the preinitialized device and the C-ABI request use one adapter.
+            const powerParam = new URLSearchParams(location.search).get("power") || "auto";
+            const powerPreference = powerParam === "high-perf" || powerParam === "high-performance"
+                ? "high-performance"
+                : (powerParam === "low-power" ? "low-power" : undefined);
+            const powerCode = powerPreference === "high-performance" ? 1
+                : (powerPreference === "low-power" ? 2 : 0);
+            // `ca_wasm_main()` requests its own C-ABI adapter during main(), so
+            // the preference has to be handed over in preRun (which runs after
+            // instantiation but before main).
+            Module.preRun = (Module.preRun || []).concat([
+                function () {
+                    if (Module._ca_wasm_set_adapter_preference) {
+                        Module._ca_wasm_set_adapter_preference(powerCode);
+                    }
+                },
+            ]);
+
             let adapter;
             try {
-                adapter = await navigator.gpu.requestAdapter();
+                adapter = await navigator.gpu.requestAdapter(
+                    powerPreference ? { powerPreference } : undefined,
+                );
             } catch (error) {
                 console.error("navigator.gpu.requestAdapter() threw:", error);
             }

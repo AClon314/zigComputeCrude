@@ -105,6 +105,11 @@ pub const ProbeResult = struct {
     limits: GpuLimits = .{},
     adapter_backend_type: wgpu.WGPUBackendType = wgpu.WGPUBackendType_Undefined,
     adapter_vendor_id: u32 = 0,
+    /// Which preference produced this adapter (`.auto` is the C default).
+    preference: AdapterPreference = .auto,
+    /// Fixed-size copy of `WGPUAdapterInfo`, so the result stays valid after
+    /// the raw string views are freed and needs no allocation.
+    adapter_info: AdapterInfo = .{},
 
     pub fn isAvailable(self: ProbeResult) bool {
         return self.available;
@@ -122,6 +127,123 @@ pub const ProbeResult = struct {
         };
     }
 };
+
+/// How the process-local context picks a WebGPU adapter.
+///
+/// This is an **init-time** switch: it is read when a context/probe is first
+/// created, and each preference is cached separately, so probing or opening two
+/// preferences in one run (e.g. an adapter ablation in the CLI) yields two
+/// independent contexts instead of invalidating the first one.
+///
+/// Measured consequence on a hybrid laptop (Ryzen 5 5600H + Vega iGPU +
+/// RTX 3050, wgpu-native v29.0.1.1): the C default (`Undefined`/`.auto`) resolves
+/// to the *integrated* adapter, `.high_performance` to the discrete one; GEMM and
+/// the chained pipeline are 1.4–2.5x faster on the discrete adapter, while a
+/// transfer-bound reduce is unchanged.  See `docs/zig-gpu-spike.md` §5.
+pub const AdapterPreference = enum {
+    /// Leave WebGPU's default in place (what the C API does with
+    /// `powerPreference = Undefined`).
+    auto,
+    high_performance,
+    low_power,
+
+    pub fn toWgpu(self: AdapterPreference) wgpu.WGPUPowerPreference {
+        return switch (self) {
+            .auto => wgpu.WGPUPowerPreference_Undefined,
+            .high_performance => wgpu.WGPUPowerPreference_HighPerformance,
+            .low_power => wgpu.WGPUPowerPreference_LowPower,
+        };
+    }
+
+    pub fn name(self: AdapterPreference) []const u8 {
+        return switch (self) {
+            .auto => "auto",
+            .high_performance => "high-performance",
+            .low_power => "low-power",
+        };
+    }
+
+    fn slot(self: AdapterPreference) usize {
+        return switch (self) {
+            .auto => 0,
+            .high_performance => 1,
+            .low_power => 2,
+        };
+    }
+};
+
+/// One adapter selection.  A struct (rather than a bare enum) so fields like
+/// "must be a discrete GPU" can be added without changing call sites; the
+/// actual filtering is still done by `powerPreference`.
+pub const AdapterSelection = struct {
+    preference: AdapterPreference = .auto,
+};
+
+/// Fixed-size, allocation-free copy of the selected adapter's `WGPUAdapterInfo`.
+pub const AdapterInfo = struct {
+    description_buf: [96]u8 = [_]u8{0} ** 96,
+    description_len: u8 = 0,
+    vendor_id: u32 = 0,
+    device_id: u32 = 0,
+    adapter_type: wgpu.WGPUAdapterType = wgpu.WGPUAdapterType_Unknown,
+    backend_type: wgpu.WGPUBackendType = wgpu.WGPUBackendType_Undefined,
+
+    /// The adapter's description (e.g. "NVIDIA GeForce RTX 3050 Laptop GPU").
+    /// Takes a pointer receiver on purpose: the returned slice points into
+    /// `self`, so a by-value receiver would hand back a dangling slice.
+    pub fn description(self: *const AdapterInfo) []const u8 {
+        return self.description_buf[0..self.description_len];
+    }
+
+    pub fn adapterTypeName(self: AdapterInfo) []const u8 {
+        return switch (self.adapter_type) {
+            wgpu.WGPUAdapterType_DiscreteGPU => "discrete",
+            wgpu.WGPUAdapterType_IntegratedGPU => "integrated",
+            wgpu.WGPUAdapterType_CPU => "cpu",
+            else => "unknown",
+        };
+    }
+
+    pub fn isDiscrete(self: AdapterInfo) bool {
+        return self.adapter_type == wgpu.WGPUAdapterType_DiscreteGPU;
+    }
+
+    fn fromRaw(raw: wgpu.WGPUAdapterInfo) AdapterInfo {
+        var info = AdapterInfo{
+            .vendor_id = raw.vendorID,
+            .device_id = raw.deviceID,
+            .adapter_type = @intCast(raw.adapterType),
+            .backend_type = raw.backendType,
+        };
+        const text = stringViewSlice(raw.description);
+        const len = @min(text.len, info.description_buf.len);
+        @memcpy(info.description_buf[0..len], text[0..len]);
+        info.description_len = @intCast(len);
+        return info;
+    }
+};
+
+/// Human-readable backend name for diagnostics (the native Linux path is Vulkan
+/// today; the others exist so a browser/other-platform report stays readable).
+pub fn backendTypeName(backend_type: wgpu.WGPUBackendType) []const u8 {
+    return switch (backend_type) {
+        wgpu.WGPUBackendType_Null => "null",
+        wgpu.WGPUBackendType_WebGPU => "webgpu",
+        wgpu.WGPUBackendType_D3D11 => "d3d11",
+        wgpu.WGPUBackendType_D3D12 => "d3d12",
+        wgpu.WGPUBackendType_Metal => "metal",
+        wgpu.WGPUBackendType_Vulkan => "vulkan",
+        wgpu.WGPUBackendType_OpenGL => "opengl",
+        wgpu.WGPUBackendType_OpenGLES => "opengles",
+        else => "undefined",
+    };
+}
+
+fn stringViewSlice(view: wgpu.WGPUStringView) []const u8 {
+    const data = view.data orelse return "";
+    if (view.length == wgpu.WGPU_STRLEN) return std.mem.sliceTo(data, 0);
+    return data[0..view.length];
+}
 
 const InitFailure = error{
     InstanceUnavailable,
@@ -245,15 +367,27 @@ pub const GpuContext = struct {
     limits: GpuLimits = .{},
     adapter_backend_type: wgpu.WGPUBackendType = wgpu.WGPUBackendType_Undefined,
     adapter_vendor_id: u32 = 0,
+    adapter_info: AdapterInfo = .{},
 
     /// Explicit context construction keeps the original small `GpuError`
     /// contract.  The one-time probe below uses `initDetailed` so it can tell
     /// callers which initialization stage failed.
     pub fn init(allocator: std.mem.Allocator) !GpuContext {
-        return initDetailed(allocator) catch return error.GpuError;
+        return initDetailed(allocator, .{}) catch return error.GpuError;
     }
 
-    fn initDetailed(allocator: std.mem.Allocator) InitFailure!GpuContext {
+    /// Same as `init`, but with an explicit adapter selection (init-time switch).
+    pub fn initWithAdapter(
+        allocator: std.mem.Allocator,
+        selection: AdapterSelection,
+    ) !GpuContext {
+        return initDetailed(allocator, selection) catch return error.GpuError;
+    }
+
+    fn initDetailed(
+        allocator: std.mem.Allocator,
+        selection: AdapterSelection,
+    ) InitFailure!GpuContext {
         var self = GpuContext{ .allocator = allocator };
         errdefer self.deinit();
 
@@ -261,7 +395,9 @@ pub const GpuContext = struct {
             return error.InstanceUnavailable;
 
         var adapter_state = AdapterRequestState{};
-        _ = wgpu.wgpuInstanceRequestAdapter(self.instance, null, .{
+        var adapter_options = wgpu.WGPURequestAdapterOptions.initial;
+        adapter_options.powerPreference = selection.preference.toWgpu();
+        _ = wgpu.wgpuInstanceRequestAdapter(self.instance, &adapter_options, .{
             .nextInChain = null,
             .mode = wgpu.WGPUCallbackMode_AllowProcessEvents,
             .callback = adapterCallback,
@@ -294,6 +430,7 @@ pub const GpuContext = struct {
         if (info_status != wgpu.WGPUStatus_Success) return error.AdapterInfoUnavailable;
         self.adapter_backend_type = info.backendType;
         self.adapter_vendor_id = info.vendorID;
+        self.adapter_info = AdapterInfo.fromRaw(info);
 
         // Query the adapter before requesting a device and query the device
         // again below.  The device limits are authoritative for the context;
@@ -340,11 +477,12 @@ pub const GpuContext = struct {
         return self;
     }
 
-    /// Return the cached native WebGPU capability result.  The static method
-    /// form keeps the probe discoverable as part of `GpuContext` while the
-    /// cache itself lives at module scope.
+    /// Return the cached native WebGPU capability result for the process
+    /// default adapter selection.  The static method form keeps the probe
+    /// discoverable as part of `GpuContext` while the cache itself lives at
+    /// module scope.
     pub fn probe() ProbeResult {
-        return probeCached();
+        return probeCachedWith(adapterSelection().preference);
     }
 
     /// Return whether this context can represent both the requested buffers
@@ -352,6 +490,14 @@ pub const GpuContext = struct {
     /// error.
     pub fn canRun(self: *const GpuContext, n_bytes: usize, groups: usize) bool {
         return self.limits.canRun(n_bytes, groups);
+    }
+
+    /// Which physical adapter this context actually opened.  WebGPU's default
+    /// power preference is *not* "the fastest GPU": on a hybrid machine it
+    /// resolves to the integrated adapter, so callers that care should log this
+    /// (or pass `AdapterSelection{ .preference = .high_performance }`).
+    pub fn adapterInfo(self: *const GpuContext) AdapterInfo {
+        return self.adapter_info;
     }
 
     pub fn deinit(self: *GpuContext) void {
@@ -654,11 +800,24 @@ fn stringView(comptime text: []const u8) wgpu.WGPUStringView {
     return .{ .data = text.ptr, .length = text.len };
 }
 
-var global_context: ?GpuContext = null;
-var probe_done: bool = false;
-var cached_probe: ProbeResult = ProbeResult.unavailable(.not_probed);
 var probe_override_for_testing: ?ProbeResult = null;
 var probe_mutex: std.atomic.Mutex = .unlocked;
+
+/// Default selection used by `probe()` / `global()`.  Set it before the first
+/// GPU use (`setAdapterSelection`); a library consumer normally leaves it at
+/// `.auto`.
+var default_selection: AdapterSelection = .{};
+
+/// One cached probe per `AdapterPreference` (3 slots).  Keeping them separate
+/// means an adapter ablation can open the iGPU and the dGPU in the same process
+/// without pulling the device out from under the first context.
+const adapter_slot_count = 3;
+const ProbeSlot = struct {
+    done: bool = false,
+    result: ProbeResult = ProbeResult.unavailable(.not_probed),
+    context: ?GpuContext = null,
+};
+var probe_slots: [adapter_slot_count]ProbeSlot = .{ .{}, .{}, .{} };
 
 var fallback_reason: ?[]const u8 = null;
 var fallback_mutex: std.atomic.Mutex = .unlocked;
@@ -681,46 +840,89 @@ fn failureForInitError(err: InitFailure) ProbeFailure {
 }
 
 fn probeLocked() ProbeResult {
-    if (probe_done) return cached_probe;
+    return probeWithLocked(default_selection.preference);
+}
+
+/// Probe (and keep) the context for one preference.  Called with `probe_mutex`
+/// held.  A successful probe stores the context in that preference's slot, which
+/// is what the void-API engine (`global()`) reads back.
+fn probeWithLocked(preference: AdapterPreference) ProbeResult {
+    const slot = &probe_slots[preference.slot()];
+    if (slot.done) return slot.result;
     if (probe_override_for_testing) |override| {
-        cached_probe = override;
-        probe_done = true;
-        return cached_probe;
+        slot.result = override;
+        slot.done = true;
+        return slot.result;
     }
 
-    const context = GpuContext.initDetailed(std.heap.page_allocator) catch |err| {
-        cached_probe = ProbeResult.unavailable(failureForInitError(err));
-        probe_done = true;
-        return cached_probe;
+    const context = GpuContext.initDetailed(
+        std.heap.page_allocator,
+        .{ .preference = preference },
+    ) catch |err| {
+        slot.result = ProbeResult.unavailable(failureForInitError(err));
+        slot.done = true;
+        return slot.result;
     };
 
-    global_context = context;
-    cached_probe = .{
+    slot.context = context;
+    slot.result = .{
         .available = true,
         .failure = .none,
         .reason = ProbeFailure.none.reason(),
         .limits = context.limits,
         .adapter_backend_type = context.adapter_backend_type,
         .adapter_vendor_id = context.adapter_vendor_id,
+        .preference = preference,
+        .adapter_info = context.adapter_info,
     };
-    probe_done = true;
-    return cached_probe;
+    slot.done = true;
+    return slot.result;
 }
 
-/// Probe native WebGPU exactly once per process.  Both success and failure
-/// are cached, and the mutex also serializes initialization with `global()`.
-/// A successful probe owns the context used by subsequent GPU operations, so
-/// selection does not probe once and then silently initialize a different
-/// context later.
-fn probeCached() ProbeResult {
+/// Probe native WebGPU exactly once per adapter preference.  Both success and
+/// failure are cached, and the mutex also serializes initialization with
+/// `global()`.  A successful probe owns the context used by subsequent GPU
+/// operations, so selection does not probe once and then silently initialize a
+/// different context later.
+fn probeCachedWith(preference: AdapterPreference) ProbeResult {
     lock(&probe_mutex);
     defer probe_mutex.unlock();
-    return probeLocked();
+    return probeWithLocked(preference);
+}
+
+/// Set the adapter preference used by `probe()` / `global()` / the
+/// comptime-dispatched engine.
+///
+/// This is an init-time switch: call it before the first GPU use.  Contexts
+/// already created for an earlier preference stay valid (each preference is
+/// cached separately), but they are not reused by `global()` afterwards.
+/// Returns the previous selection.
+pub fn setAdapterSelection(selection: AdapterSelection) AdapterSelection {
+    lock(&probe_mutex);
+    defer probe_mutex.unlock();
+    const previous = default_selection;
+    default_selection = selection;
+    return previous;
+}
+
+/// The selection `probe()` / `global()` currently use.
+pub fn adapterSelection() AdapterSelection {
+    lock(&probe_mutex);
+    defer probe_mutex.unlock();
+    return default_selection;
 }
 
 /// Top-level alias for callers that do not retain the context type.
 pub fn probe() ProbeResult {
-    return probeCached();
+    lock(&probe_mutex);
+    defer probe_mutex.unlock();
+    return probeWithLocked(default_selection.preference);
+}
+
+/// Probe a specific adapter preference without changing the process default.
+/// This is what an adapter ablation uses.
+pub fn probeWithAdapter(selection: AdapterSelection) ProbeResult {
+    return probeCachedWith(selection.preference);
 }
 
 /// The comptime-dispatched engine has a void API, so its GPU implementation
@@ -730,12 +932,13 @@ pub fn global() !*GpuContext {
     lock(&probe_mutex);
     defer probe_mutex.unlock();
 
-    const result = if (global_context != null) cached_probe else probeLocked();
+    const preferred = &probe_slots[default_selection.preference.slot()];
+    const result = if (preferred.context != null) preferred.result else probeWithLocked(default_selection.preference);
     if (!result.available) {
         recordFallback(result.reason);
         return error.GpuError;
     }
-    return &global_context.?;
+    return &preferred.context.?;
 }
 
 /// Reset the process-local GPU state.  This is primarily useful for tests and
@@ -745,10 +948,12 @@ pub fn resetGlobal() void {
     lock(&probe_mutex);
     defer probe_mutex.unlock();
 
-    if (global_context) |*context| context.deinit();
-    global_context = null;
-    probe_done = false;
-    cached_probe = ProbeResult.unavailable(.not_probed);
+    for (&probe_slots) |*slot| {
+        if (slot.context) |*context| context.deinit();
+        slot.context = null;
+        slot.done = false;
+        slot.result = ProbeResult.unavailable(.not_probed);
+    }
     probe_override_for_testing = null;
     clearFallbackReason();
 }
@@ -760,10 +965,12 @@ pub fn setProbeOverrideForTesting(override: ?ProbeResult) void {
     lock(&probe_mutex);
     defer probe_mutex.unlock();
 
-    if (global_context) |*context| context.deinit();
-    global_context = null;
-    probe_done = false;
-    cached_probe = ProbeResult.unavailable(.not_probed);
+    for (&probe_slots) |*slot| {
+        if (slot.context) |*context| context.deinit();
+        slot.context = null;
+        slot.done = false;
+        slot.result = ProbeResult.unavailable(.not_probed);
+    }
     probe_override_for_testing = override;
     clearFallbackReason();
 }
@@ -810,4 +1017,80 @@ test "GPU limits bound buffers and the 2D dispatch grid" {
     };
     try std.testing.expect(available_probe.canRun(4096, 4));
     try std.testing.expect(!ProbeResult.unavailable(.none).canRun(4096, 4));
+}
+
+test "adapter info keeps its own copy of the description string" {
+    // `description()` returns a slice into the struct, so this asserts the copy
+    // really lives inside `AdapterInfo` (a by-value receiver used to hand back a
+    // dangling stack slice here).
+    var info = AdapterInfo{};
+    const text = "NVIDIA GeForce RTX 3050 Laptop GPU";
+    @memcpy(info.description_buf[0..text.len], text);
+    info.description_len = @intCast(text.len);
+
+    const description = info.description();
+    try std.testing.expectEqualStrings(text, description);
+    try std.testing.expect(description.ptr == &info.description_buf);
+
+    info.adapter_type = wgpu.WGPUAdapterType_DiscreteGPU;
+    try std.testing.expect(info.isDiscrete());
+    try std.testing.expectEqualStrings("discrete", info.adapterTypeName());
+    info.adapter_type = wgpu.WGPUAdapterType_IntegratedGPU;
+    try std.testing.expect(!info.isDiscrete());
+    try std.testing.expectEqualStrings("integrated", info.adapterTypeName());
+}
+
+test "adapter preference maps to the WebGPU power preference" {
+    try std.testing.expectEqual(
+        wgpu.WGPUPowerPreference_Undefined,
+        AdapterPreference.auto.toWgpu(),
+    );
+    try std.testing.expectEqual(
+        wgpu.WGPUPowerPreference_HighPerformance,
+        AdapterPreference.high_performance.toWgpu(),
+    );
+    try std.testing.expectEqual(
+        wgpu.WGPUPowerPreference_LowPower,
+        AdapterPreference.low_power.toWgpu(),
+    );
+    // Each preference must land in its own cache slot, otherwise probing two
+    // adapters in one process would tear down the first context.
+    try std.testing.expect(AdapterPreference.auto.slot() != AdapterPreference.high_performance.slot());
+    try std.testing.expect(AdapterPreference.low_power.slot() != AdapterPreference.high_performance.slot());
+}
+
+test "probeWithAdapter reports which adapter each preference selected" {
+    defer resetGlobal();
+
+    const auto = probeWithAdapter(.{ .preference = .auto });
+    const fast = probeWithAdapter(.{ .preference = .high_performance });
+
+    if (!auto.available and !fast.available) return error.SkipZigTest;
+
+    try std.testing.expectEqual(AdapterPreference.auto, auto.preference);
+    try std.testing.expectEqual(AdapterPreference.high_performance, fast.preference);
+
+    if (auto.available) {
+        try std.testing.expect(auto.adapter_info.description().len > 0);
+        try std.testing.expect(auto.adapter_info.backend_type != wgpu.WGPUBackendType_Undefined);
+    } else {
+        // A device that cannot satisfy the default preference can still satisfy
+        // an explicit one (and vice versa): the failures are cached per slot.
+        try std.testing.expect(fast.failure != .not_probed);
+    }
+
+    std.debug.print(
+        "\n[adapter] auto: {s} [{s}] | high-perf: {s} [{s}]\n",
+        .{
+            if (auto.available) auto.adapter_info.description() else auto.reason,
+            if (auto.available) auto.adapter_info.adapterTypeName() else "-",
+            if (fast.available) fast.adapter_info.description() else fast.reason,
+            if (fast.available) fast.adapter_info.adapterTypeName() else "-",
+        },
+    );
+
+    // Two preferences, two live contexts: the earlier one must stay usable.
+    if (auto.available and fast.available) {
+        try std.testing.expect(global() != error.GpuError);
+    }
 }

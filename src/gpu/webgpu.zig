@@ -74,7 +74,35 @@ pub const WGPUPopErrorScopeStatus_Success: WGPUPopErrorScopeStatus = 0x00000001;
 
 pub const WGPUBackendType = u32;
 pub const WGPUBackendType_Undefined: WGPUBackendType = 0x00000000;
+pub const WGPUBackendType_Null: WGPUBackendType = 0x00000001;
+pub const WGPUBackendType_WebGPU: WGPUBackendType = 0x00000002;
+pub const WGPUBackendType_D3D11: WGPUBackendType = 0x00000003;
+pub const WGPUBackendType_D3D12: WGPUBackendType = 0x00000004;
+pub const WGPUBackendType_Metal: WGPUBackendType = 0x00000005;
 pub const WGPUBackendType_Vulkan: WGPUBackendType = 0x00000006;
+pub const WGPUBackendType_OpenGL: WGPUBackendType = 0x00000007;
+pub const WGPUBackendType_OpenGLES: WGPUBackendType = 0x00000008;
+
+/// `WGPUAdapterType` — used to report whether a discrete GPU was actually
+/// selected (see `context.AdapterInfo.adapter_type`).
+pub const WGPUAdapterType = u32;
+pub const WGPUAdapterType_DiscreteGPU: WGPUAdapterType = 0x00000001;
+pub const WGPUAdapterType_IntegratedGPU: WGPUAdapterType = 0x00000002;
+pub const WGPUAdapterType_CPU: WGPUAdapterType = 0x00000003;
+pub const WGPUAdapterType_Unknown: WGPUAdapterType = 0x00000004;
+
+/// `WGPUPowerPreference` — the only adapter-selection knob this backend uses.
+/// `Undefined` (the C default) does *not* mean "high performance"; on a
+/// dual-GPU Linux machine wgpu-native resolves it to the integrated adapter.
+pub const WGPUPowerPreference = u32;
+pub const WGPUPowerPreference_Undefined: WGPUPowerPreference = 0x00000000;
+pub const WGPUPowerPreference_LowPower: WGPUPowerPreference = 0x00000001;
+pub const WGPUPowerPreference_HighPerformance: WGPUPowerPreference = 0x00000002;
+
+pub const WGPUFeatureLevel = u32;
+pub const WGPUFeatureLevel_Undefined: WGPUFeatureLevel = 0x00000000;
+pub const WGPUFeatureLevel_Compatibility: WGPUFeatureLevel = 0x00000001;
+pub const WGPUFeatureLevel_Core: WGPUFeatureLevel = 0x00000002;
 
 pub const WGPUBufferBindingType = u32;
 pub const WGPUBufferBindingType_BindingNotUsed: WGPUBufferBindingType = 0x00000000;
@@ -340,13 +368,34 @@ pub const WGPUComputePassDescriptor = extern struct {
     timestampWrites: ?*const anyopaque,
 };
 
-// Request descriptors are passed as null in this backend.  They are intentionally
-// opaque here to keep the binding limited to the compute subset actually used.
+// Adapter/device request descriptors: only `WGPURequestAdapterOptions` needs a
+// body (it carries the power preference).  `wgpuCreateInstance` and
+// `wgpuAdapterRequestDevice` keep opaque descriptors because this backend passes
+// null there.
+pub const WGPURequestAdapterOptions = extern struct {
+    nextInChain: ?*WGPUChainedStruct,
+    featureLevel: WGPUFeatureLevel,
+    powerPreference: WGPUPowerPreference,
+    forceFallbackAdapter: WGPUBool,
+    backendType: WGPUBackendType,
+    compatibleSurface: ?*anyopaque,
+
+    /// Mirrors `WGPU_REQUEST_ADAPTER_OPTIONS_INIT` in both headers.
+    pub const initial: WGPURequestAdapterOptions = .{
+        .nextInChain = null,
+        .featureLevel = WGPUFeatureLevel_Undefined,
+        .powerPreference = WGPUPowerPreference_Undefined,
+        .forceFallbackAdapter = 0,
+        .backendType = WGPUBackendType_Undefined,
+        .compatibleSurface = null,
+    };
+};
+
 pub extern fn wgpuCreateInstance(descriptor: ?*const anyopaque) WGPUInstance;
 pub extern fn wgpuInstanceProcessEvents(instance: WGPUInstance) void;
 pub extern fn wgpuInstanceRequestAdapter(
     instance: WGPUInstance,
-    options: ?*const anyopaque,
+    options: ?*const WGPURequestAdapterOptions,
     callbackInfo: WGPURequestAdapterCallbackInfo,
 ) WGPUFuture;
 pub extern fn wgpuAdapterRequestDevice(

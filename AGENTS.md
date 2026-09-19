@@ -19,7 +19,10 @@ Blender/节点的语义（域模型、属性传播、节点图求值、色彩/�
 
 1. **一绑定两目标**：`src/gpu/webgpu.zig` 的手写 C ABI 子集必须同时兼容
    `vendor/wgpu-native` 与 `.em-cache/.../emdawnwebgpu` 的 `webgpu.h`。
-   新增/修改符号后必须跑 `tools/check_abi_drift.sh`；扩展绑定要同步更新检查脚本的符号清单。
+   新增/修改符号后必须跑 `tools/check_abi_drift.sh`。该脚本检查三类东西：
+   ①函数原型（`SYMBOLS` 清单，扩展绑定要同步改这里）；②所有 `extern struct` 的
+   **字段清单**、③绑定里硬编码的**常量值**——②③ 从 `src/gpu/webgpu.zig` 自动推导，
+   不需要维护第二份清单，但意味着修改绑定后必须重跑。
 2. **禁用清单**：`wgpuInstanceWaitAny`、`wgpuDevicePoll`、SPIR-V（shader 只有 WGSL）、
    ASYNCIFY、push constants/immediates。异步只能 `ProcessEvents` 轮询推进。
 3. **错误语义**：GPU 失败一律 `error.GpuError`；`ComputeEngine(.gpu_webgpu)` 可回退 CPU，

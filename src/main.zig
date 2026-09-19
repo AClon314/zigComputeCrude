@@ -138,8 +138,38 @@ fn printUsage(writer: *Io.Writer) !void {
             "       computeAccel --kernel reduce [--size <n>] [--op sum|max] [--iters <n>]\n" ++
             "       computeAccel --kernel chain [--chain saxpy|pipeline] [--chain-lens 1,4,16,64] [--size <n>] [--iters <n>]\n" ++
             "       computeAccel --kernel spatial [--points <n>] [--queries <n>] [--radius <r>] [--iters <n>]\n" ++
-            "   --kernel add is the default; --backend/--auto/--heuristic only apply to it.\n",
+            "   --kernel add is the default; --backend/--auto/--heuristic only apply to it.\n" ++
+            "   --adapter auto|high-perf|low-power selects the WebGPU adapter (init-time switch);\n" ++
+            "   the default (auto) is WebGPU's own default, which is *not* necessarily the fastest GPU.\n",
         .{},
+    );
+}
+
+/// Parse `--adapter`: an init-time switch, applied before any GPU call.
+fn parseAdapterPreference(text: []const u8) ?computeAccel.AdapterPreference {
+    if (std.mem.eql(u8, text, "auto")) return .auto;
+    if (std.mem.eql(u8, text, "high-perf") or std.mem.eql(u8, text, "high-performance")) {
+        return .high_performance;
+    }
+    if (std.mem.eql(u8, text, "low-power")) return .low_power;
+    return null;
+}
+
+/// One line showing which adapter the process actually opened.  Printed next to
+/// every GPU result because the default preference can silently land on the
+/// integrated GPU of a hybrid machine (docs/zig-gpu-spike.md §5).
+fn printAdapter(writer: *Io.Writer, probe: computeAccel.ProbeResult) !void {
+    const info = &probe.adapter_info;
+    try writer.print(
+        "adapter      {s} [{s}, {s}] vendor=0x{x} device=0x{x} (preference={s})\n",
+        .{
+            info.description(),
+            info.adapterTypeName(),
+            computeAccel.backendTypeName(info.backend_type),
+            info.vendor_id,
+            info.device_id,
+            probe.preference.name(),
+        },
     );
 }
 
@@ -187,6 +217,7 @@ pub fn main(init: std.process.Init) !void {
     var point_count: usize = default_spatial_points;
     var query_count: usize = default_spatial_queries;
     var radius: f32 = default_spatial_radius;
+    var adapter_preference: computeAccel.AdapterPreference = .auto;
 
     var i: usize = 1;
     while (i < args.len) {
@@ -239,6 +270,15 @@ pub fn main(init: std.process.Init) !void {
             if (!try requireValue(stdout_writer, args, i, "--chain")) return;
             chain_kind = parseChainKind(args[i + 1]) orelse {
                 try stdout_writer.print("error: unknown chain '{s}' (expected saxpy|pipeline)\n", .{args[i + 1]});
+                try printUsage(stdout_writer);
+                try stdout_writer.flush();
+                return;
+            };
+            i += 2;
+        } else if (std.mem.eql(u8, arg, "--adapter")) {
+            if (!try requireValue(stdout_writer, args, i, "--adapter")) return;
+            adapter_preference = parseAdapterPreference(args[i + 1]) orelse {
+                try stdout_writer.print("error: unknown adapter '{s}' (expected auto|high-perf|low-power)\n", .{args[i + 1]});
                 try printUsage(stdout_writer);
                 try stdout_writer.flush();
                 return;
@@ -298,6 +338,10 @@ pub fn main(init: std.process.Init) !void {
             .spatial => default_chain_iters,
         };
     }
+
+    // Adapter preference is an init-time switch: apply it before any GPU call so
+    // the first probe (and therefore every later context) uses it.
+    _ = computeAccel.setAdapterSelection(.{ .preference = adapter_preference });
 
     switch (kernel) {
         .add => try runAddDemo(stdout_writer, arena, mode, manual_backend, size, iters),
@@ -566,6 +610,7 @@ fn runGemmDemo(
         try writer.print("gpu_webgpu: 不可用（{s}）；以上为 CPU 结果\n", .{probe.reason});
         return;
     }
+    try printAdapter(writer, probe);
 
     const variants: []const computeAccel.gemm.Variant = switch (variant_choice) {
         .simple => &.{.simple},
@@ -709,6 +754,7 @@ fn runReduceDemo(
         try writer.print("gpu_webgpu: 不可用（{s}）；以上为 CPU 结果\n", .{probe.reason});
         return;
     }
+    try printAdapter(writer, probe);
     if (!computeAccel.reduce.canRun(probe.limits, size)) {
         try writer.print("gpu_webgpu: 超出设备 limits（input buffer / dispatch grid），跳过\n", .{});
         return;
@@ -823,6 +869,7 @@ fn runChainDemo(
         try writer.print("chain demo: gpu_webgpu 不可用（{s}）\n", .{probe.reason});
         return;
     }
+    try printAdapter(writer, probe);
     const ctx = computeAccel.runtime.open() catch |err| {
         try writer.print("chain demo: 打开设备失败（{s}）\n", .{computeAccel.gpu.lastFallbackReason() orelse @errorName(err)});
         return;
@@ -1169,6 +1216,7 @@ fn runSpatialDemo(
         try writer.print("gpu_webgpu: 不可用（{s}）；以上为 CPU 结果\n", .{probe.reason});
         return;
     }
+    try printAdapter(writer, probe);
     const ctx = computeAccel.runtime.open() catch |err| {
         try writer.print("gpu_webgpu: 打开设备失败（{s}）\n", .{computeAccel.gpu.lastFallbackReason() orelse @errorName(err)});
         return;
