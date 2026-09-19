@@ -189,7 +189,16 @@ host 运行时（Buffer/Kernel/Chain）、对拍契约、以及 spatial 这类�
 
 ### 5.3 结论与建议（已实现，见 README「adapter 消融」）
 
-> 状态：2026-09-19 已实现。`AdapterPreference{auto,high_performance,low_power}` +
+> 状态：2026-09-19 已实现。浏览器侧也补齐了：`shell.html` 用四种请求
+> （`auto` / `high-performance` / `low-power` / `forceFallbackAdapter`）枚举所有*能被请求到*的
+> 适配器（浏览器没有 `enumerateAdapters`），去重后**对每块卡跑同一份 WGSL add** 并位精确对拍，
+> 同时对照 JS 侧 `adapter.info` 与 C ABI 侧身份（`ca_wasm_adapter_info`）+ 逐次 run 状态
+> （`ca_wasm_run`/`ca_wasm_run_state`，用 generation 计数丢弃上一轮的异步回调）。
+> 实测（Chrome 154 + Vulkan，本机三块适配器）：`nvidia · ampere`、`amd · gcn-5`、
+> `google · swiftshader` 全部 MATCH，JS↔C ABI 身份逐块一致；`?power=low-power` 时首轮
+> 确实落在 amd（iGPU）——**浏览器默认偏好按规范是 `low-power`，与 native 侧同一个坑**。
+>
+> 状态：`AdapterPreference{auto,high_performance,low_power}` +
 > `AdapterSelection` + `setAdapterSelection`（init-time 开关）+ `GpuContext.initWithAdapter`；
 > `probe()` 透出 `adapter_info`（description / adapterType / vendorID / deviceID / backendType），
 > 每个偏好各缓存一个 context（同一进程可跑两种 adapter 对比）；CLI `--adapter`；

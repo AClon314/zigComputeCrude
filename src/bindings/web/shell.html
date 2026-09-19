@@ -13,11 +13,12 @@
             font: 14px system-ui, sans-serif;
         }
         main {
-            max-width: 900px;
-            margin: 5rem auto;
+            max-width: 1100px;
+            margin: 4rem auto;
             padding: 0 1.5rem;
         }
         h1 { font-size: 1.25rem; }
+        h2 { font-size: 1rem; margin: 2rem 0 0.5rem; color: #9da9bb; }
         #status {
             padding: 1rem;
             border: 1px solid #3e4b60;
@@ -27,20 +28,49 @@
             white-space: pre-wrap;
             overflow-wrap: anywhere;
         }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font: 13px ui-monospace, monospace;
+        }
+        th, td {
+            border: 1px solid #2c3644;
+            padding: 0.35rem 0.5rem;
+            text-align: left;
+            vertical-align: top;
+            overflow-wrap: anywhere;
+        }
+        th { background: #171d27; color: #9da9bb; font-weight: 600; }
+        .ok { color: #86e08a; }
+        .bad { color: #ff8a8a; }
+        .skip { color: #8b97a8; }
         #details { color: #9da9bb; line-height: 1.5; }
+        code { color: #cbd6e6; }
     </style>
 </head>
 <body>
     <main>
         <h1>computeAccel — browser WebGPU backend</h1>
         <div id="status">加载 WebGPU 中...</div>
+        <h2>可请求到的适配器（JS 侧 navigator.gpu.requestAdapter）</h2>
+        <div id="adapters">—</div>
+        <h2>逐块 GPU 跑同一份 WGSL add（C ABI 侧）</h2>
+        <div id="results">—</div>
         <p id="details">
-            页面会先执行 CPU SIMD add，再由同一份 WGSL kernel 执行 GPU add，最后逐个
-            比较 1,048,576 个 f32。只有显示 <code>GPU add: MATCH</code> 才算通过。
+            对每一块能被请求到的 GPU（auto / high-performance / low-power / software fallback，
+            浏览器无法枚举适配器，这就是全部可请求项）执行：CPU SIMD 参考 + 同一份 WGSL kernel，
+            再逐个比较 1,048,576 个 f32（<b>位精确</b>）。只有 <code>GPU add: MATCH</code> 才算通过。
+            第三列是 C ABI 侧自己请求到的适配器身份，用来确认它和 JS 侧枚举的不是两块不同的卡
+            （混合显卡上默认偏好可能落到 iGPU；见 <code>docs/zig-gpu-spike.md</code> §5）。
+            <b>GPU add 列是单次端到端耗时</b>（含管线创建、上传、dispatch、回读），只用于量级比较，
+            不是稳态基准；想比性能请用 native CLI（<code>--adapter</code> / <code>--kernel chain</code>）。
+            最后一次 run 的状态显示在顶部，全量结果在下表。
         </p>
     </main>
     <script type="text/javascript">
         const statusElement = document.getElementById("status");
+        const adaptersElement = document.getElementById("adapters");
+        const resultsElement = document.getElementById("results");
         const textDecoder = new TextDecoder();
 
         window.addEventListener("error", function (event) {
@@ -56,6 +86,24 @@
 
         function setStatus(text) {
             statusElement.textContent = text;
+        }
+
+        function escapeHtml(text) {
+            return String(text).replace(/[&<>"]/g, function (ch) {
+                return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch];
+            });
+        }
+
+        function renderTable(headers, rows) {
+            let html = "<table><thead><tr>";
+            for (const header of headers) html += "<th>" + escapeHtml(header) + "</th>";
+            html += "</tr></thead><tbody>";
+            for (const row of rows) {
+                html += "<tr>";
+                for (const cell of row) html += "<td>" + cell + "</td>";
+                html += "</tr>";
+            }
+            return html + "</tbody></table>";
         }
 
         function readWasmStatus() {
@@ -80,6 +128,111 @@
             }
         }
 
+        function readCString(read) {
+            try {
+                const ptr = read() >>> 0;
+                if (!ptr) return "";
+                const heap = Module.HEAPU8 ||
+                    (Module.wasmMemory && new Uint8Array(Module.wasmMemory.buffer));
+                if (!heap) return "";
+                let end = ptr;
+                const limit = Math.min(heap.length, ptr + 1024);
+                while (end < limit && heap[end] !== 0) end++;
+                return textDecoder.decode(heap.subarray(ptr, end));
+            } catch (error) {
+                console.error("reading C string failed:", error);
+                return "";
+            }
+        }
+
+        // ---- 适配器候选：浏览器无法枚举，只能用这四种请求覆盖 ----
+        const CANDIDATES = [
+            { code: 0, label: "auto", options: undefined },
+            { code: 1, label: "high-performance", options: { powerPreference: "high-performance" } },
+            { code: 2, label: "low-power", options: { powerPreference: "low-power" } },
+            { code: 3, label: "software fallback", options: { forceFallbackAdapter: true } },
+        ];
+
+        function adapterFields(adapter) {
+            const info = adapter && adapter.info ? adapter.info : {};
+            return {
+                vendor: info.vendor || "",
+                architecture: info.architecture || "",
+                device: info.device || "",
+                description: info.description || "",
+                isFallback: !!adapter.isFallbackAdapter,
+            };
+        }
+
+        function adapterIdentity(fields) {
+            return [fields.vendor, fields.architecture, fields.device, fields.description]
+                .map(function (part) { return part.trim().toLowerCase(); })
+                .filter(Boolean)
+                .join(" | ");
+        }
+
+        function adapterSummary(fields) {
+            const parts = [fields.vendor, fields.architecture, fields.device, fields.description]
+                .filter(Boolean);
+            if (parts.length === 0) parts.push("(浏览器未提供 adapter.info)");
+            if (fields.isFallback) parts.push("isFallbackAdapter");
+            return parts.join(" · ");
+        }
+
+        async function requestCandidate(candidate) {
+            try {
+                const adapter = await navigator.gpu.requestAdapter(candidate.options);
+                if (!adapter) return null;
+                return { adapter: adapter, fields: adapterFields(adapter) };
+            } catch (error) {
+                console.warn("requestAdapter(" + candidate.label + ") threw:", error);
+                return null;
+            }
+        }
+
+        // ---- run 驱动：等 C ABI 侧一次 run 结束（0 = 进行中）----
+        const RUN_TIMEOUT_MS = 20000;
+
+        function waitForRun(timeoutMs) {
+            return new Promise(function (resolve) {
+                const started = performance.now();
+                function poll() {
+                    const state = Module._ca_wasm_run_state ? Module._ca_wasm_run_state() : 0;
+                    if (state !== 0) return resolve(state);
+                    if (performance.now() - started > timeoutMs) return resolve(3); // 超时
+                    window.requestAnimationFrame(poll);
+                }
+                window.requestAnimationFrame(poll);
+            });
+        }
+
+        function readRunResult() {
+            const zigInfo = Module._ca_wasm_adapter_info
+                ? readCString(function () { return Module._ca_wasm_adapter_info(); })
+                : "";
+            const gpuMs = Module._ca_wasm_last_gpu_ms ? Module._ca_wasm_last_gpu_ms() : 0;
+            const cpuMs = Module._ca_wasm_cpu_simd_ms ? Module._ca_wasm_cpu_simd_ms() : 0;
+            return { zigInfo: zigInfo, gpuMs: gpuMs, cpuMs: cpuMs };
+        }
+
+        /// C ABI 侧的身份串是否与 JS 侧看到的是同一块卡：
+        /// 至少有一个人在 JS 侧有值、且以子串出现（大小写无关）。
+        function matchesJsAdapter(fields, zigInfo) {
+            const candidates = [fields.vendor, fields.architecture, fields.device, fields.description]
+                .map(function (part) { return part.trim().toLowerCase(); })
+                .filter(function (part) { return part.length >= 3; });
+            if (candidates.length === 0 || !zigInfo) return null; // 无法判定
+            const haystack = zigInfo.toLowerCase();
+            return candidates.some(function (part) { return haystack.includes(part); });
+        }
+
+        const COLOR = { 1: "ok", 2: "bad", 3: "bad" };
+
+        function verdictCell(state) {
+            const text = state === 1 ? "MATCH" : (state === 2 ? "ERROR/MISMATCH" : "TIMEOUT");
+            return '<span class="' + (COLOR[state] || "bad") + '">' + text + "</span>";
+        }
+
         var Module = {
             print: function (text) { console.log(text); },
             printErr: function (text) { console.error(text); },
@@ -87,19 +240,112 @@
                 updateWasmStatus();
                 // main() has started ca_wasm_main().  Returning to the browser
                 // event loop lets WebGPU promises settle; this pump then
-                // delivers AllowProcessEvents callbacks.
+                // delivers AllowProcessEvents callbacks (the only async
+                // progress mechanism: no WaitAny/ASYNCIFY).
                 function frame() {
                     if (Module._ca_wasm_pump) Module._ca_wasm_pump();
                     updateWasmStatus();
                     window.requestAnimationFrame(frame);
                 }
                 window.requestAnimationFrame(frame);
+                driveAdapterRuns();
             },
             onAbort: function (reason) {
                 setStatus("WebAssembly abort: " + reason);
                 console.error("computeAccel wasm abort:", reason);
             },
         };
+
+        /// 逐块 GPU 跑同一个 WGSL add：第一次用 main() 已经起的那轮（偏好来自 ?power=），
+        /// 之后对每个尚未测过的候选调用 ca_wasm_run(code)。
+        async function driveAdapterRuns() {
+            const results = new Map(); // candidate.label -> result
+            const firstCode = firstCandidate.code;
+            const rows = [];
+
+            // 第一轮由 ca_wasm_main() 发起，直接等它结束。
+            const firstState = await waitForRun(RUN_TIMEOUT_MS);
+            results.set(firstCode, Object.assign({ state: firstState }, readRunResult()));
+
+            const seenIdentity = new Map();
+            if (firstAvailable && firstAvailable.fields) {
+                seenIdentity.set(adapterIdentity(firstAvailable.fields), firstAvailable.candidate.label);
+            }
+
+            for (const candidate of CANDIDATES) {
+                const entry = candidateEntries.get(candidate.label);
+                if (!entry) {
+                    rows.push([candidate.label, '<span class="skip">该请求没有返回适配器</span>',
+                        "—", "—", "—", "—"]);
+                    continue;
+                }
+                const identity = adapterIdentity(entry.fields);
+
+                if (candidate.code === firstCode) {
+                    const result = results.get(firstCode);
+                    rows.push([
+                        candidate.label + "（main 首轮）",
+                        escapeHtml(adapterSummary(entry.fields)),
+                        escapeHtml(result.zigInfo || "(空)") + sameAdapterCell(entry.fields, result.zigInfo),
+                        verdictCell(result.state),
+                        result.gpuMs.toFixed(3) + " ms",
+                        result.cpuMs.toFixed(3) + " ms",
+                    ]);
+                    continue;
+                }
+
+                if (identity && seenIdentity.has(identity)) {
+                    rows.push([
+                        candidate.label,
+                        escapeHtml(adapterSummary(entry.fields)),
+                        '<span class="skip">同 #' + seenIdentity.get(identity) + "，不重复运行</span>",
+                        '<span class="skip">skipped</span>', "—", "—",
+                    ]);
+                    continue;
+                }
+                if (identity) seenIdentity.set(identity, candidate.label);
+
+                setStatus("运行中: " + candidate.label + " ...");
+                Module._ca_wasm_run(candidate.code);
+                const state = await waitForRun(RUN_TIMEOUT_MS);
+                const result = readRunResult();
+                results.set(candidate.code, Object.assign({ state: state }, result));
+                rows.push([
+                    candidate.label,
+                    escapeHtml(adapterSummary(entry.fields)),
+                    escapeHtml(result.zigInfo || "(空)") + sameAdapterCell(entry.fields, result.zigInfo),
+                    verdictCell(state),
+                    result.gpuMs.toFixed(3) + " ms",
+                    result.cpuMs.toFixed(3) + " ms",
+                ]);
+            }
+
+            resultsElement.innerHTML = renderTable(
+                ["候选请求", "JS 侧 adapter.info", "C ABI 侧 adapter 身份", "结果", "GPU add", "CPU SIMD"],
+                rows,
+            );
+
+            const tested = rows.filter(function (row) { return row[3].indexOf("skip") === -1; }).length;
+            const passed = Array.from(results.values()).filter(function (r) { return r.state === 1; }).length;
+            const failed = tested - passed;
+            setStatus(
+                "自检完成: 可请求到 " + candidateEntries.size + " 个候选，实际运行 " + tested +
+                " 块（去重后），" + passed + " 通过" + (failed > 0 ? "，" + failed + " 未通过" : "") + "。\n" +
+                "最后一块的结果: " + (readWasmStatus() || "(无)")
+            );
+        }
+
+        function sameAdapterCell(fields, zigInfo) {
+            const match = matchesJsAdapter(fields, zigInfo);
+            if (match === null) return ' <span class="skip">(无法比对)</span>';
+            return match
+                ? ' <span class="ok">✓ 与 JS 侧一致</span>'
+                : ' <span class="bad">✗ 与 JS 侧不一致</span>';
+        }
+
+        var candidateEntries = new Map(); // label -> { candidate, fields }
+        var firstCandidate = CANDIDATES[0];
+        var firstAvailable = null;
 
         async function initWebGPU() {
             // Firefox on Linux exposes partial WebGPU in some builds but is
@@ -128,46 +374,59 @@
                 return;
             }
 
-            // ?power=high-perf|low-power|auto — browsers default to low-power,
-            // which on a hybrid laptop means the integrated GPU.  The same
-            // preference is forwarded to the Zig side (ca_wasm_set_adapter_preference)
-            // so both the preinitialized device and the C-ABI request use one adapter.
-            const powerParam = new URLSearchParams(location.search).get("power") || "auto";
-            const powerPreference = powerParam === "high-perf" || powerParam === "high-performance"
-                ? "high-performance"
-                : (powerParam === "low-power" ? "low-power" : undefined);
-            const powerCode = powerPreference === "high-performance" ? 1
-                : (powerPreference === "low-power" ? 2 : 0);
-            // `ca_wasm_main()` requests its own C-ABI adapter during main(), so
-            // the preference has to be handed over in preRun (which runs after
-            // instantiation but before main).
-            Module.preRun = (Module.preRun || []).concat([
-                function () {
-                    if (Module._ca_wasm_set_adapter_preference) {
-                        Module._ca_wasm_set_adapter_preference(powerCode);
-                    }
-                },
-            ]);
-
-            let adapter;
-            try {
-                adapter = await navigator.gpu.requestAdapter(
-                    powerPreference ? { powerPreference } : undefined,
-                );
-            } catch (error) {
-                console.error("navigator.gpu.requestAdapter() threw:", error);
+            // 枚举所有能被请求到的适配器（浏览器没有 enumerateAdapters）。
+            setStatus("枚举可用适配器 ...");
+            const rows = [];
+            for (const candidate of CANDIDATES) {
+                const entry = await requestCandidate(candidate);
+                if (entry) {
+                    candidateEntries.set(candidate.label, { candidate: candidate, adapter: entry.adapter, fields: entry.fields });
+                }
+                rows.push([
+                    candidate.label,
+                    entry
+                        ? escapeHtml(adapterSummary(entry.fields))
+                        : '<span class="skip">null（该请求拿不到适配器）</span>',
+                ]);
             }
-            if (!adapter) {
+            adaptersElement.innerHTML = renderTable(["候选请求", "adapter.info"], rows);
+
+            if (candidateEntries.size === 0) {
                 setStatus("没有可用的 WebGPU 适配器（硬件加速被禁用？）");
                 console.error("No WebGPU adapter found.");
                 return;
             }
 
+            // ?power=high-perf|low-power|auto|fallback —— 决定 main() 首轮用哪个偏好，
+            // 也决定 preinitialized device 用哪块卡。默认取第一个能拿到的候选。
+            const powerParam = (new URLSearchParams(location.search).get("power") || "auto").toLowerCase();
+            const wantedLabel = powerParam === "high-perf" || powerParam === "high-performance"
+                ? "high-performance"
+                : (powerParam === "low-power"
+                    ? "low-power"
+                    : (powerParam === "fallback" || powerParam === "software"
+                        ? "software fallback"
+                        : "auto"));
+            firstCandidate = candidateEntries.get(wantedLabel)
+                ? CANDIDATES.filter(function (c) { return c.label === wantedLabel; })[0]
+                : CANDIDATES.filter(function (c) { return candidateEntries.has(c.label); })[0];
+            firstAvailable = candidateEntries.get(firstCandidate.label);
+
+            // `ca_wasm_main()` 在 main() 阶段就请求 adapter，所以偏好要在 preRun 里
+            // 交给 C ABI 侧（与页面的 preinitialized device 保持同一偏好）。
+            Module.preRun = (Module.preRun || []).concat([
+                function () {
+                    if (Module._ca_wasm_set_adapter_preference) {
+                        Module._ca_wasm_set_adapter_preference(firstCandidate.code);
+                    }
+                },
+            ]);
+
             // Keep the emdawnwebgpu preinitialized-device contract used by the
             // reference addWasmStep shell.  The Zig runner deliberately uses
             // the normal callback API so ProcessEvents remains the sole pump.
             try {
-                Module.preinitializedWebGPUDevice = await adapter.requestDevice();
+                Module.preinitializedWebGPUDevice = await firstAvailable.adapter.requestDevice();
             } catch (error) {
                 setStatus("requestDevice 失败: " + error);
                 console.error("adapter.requestDevice() threw:", error);

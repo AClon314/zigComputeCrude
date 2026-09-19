@@ -324,7 +324,7 @@ fn addWasmStep(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
         "-sALLOW_MEMORY_GROWTH=1",
         "--closure=1",
         "-O3",
-        "-sEXPORTED_FUNCTIONS=_main,_ca_wasm_status,_ca_wasm_pump,_ca_wasm_set_adapter_preference",
+        "-sEXPORTED_FUNCTIONS=_main,_ca_wasm_status,_ca_wasm_pump,_ca_wasm_set_adapter_preference,_ca_wasm_run,_ca_wasm_run_state,_ca_wasm_adapter_info,_ca_wasm_last_gpu_ms,_ca_wasm_cpu_simd_ms",
         "-sEXPORTED_RUNTIME_METHODS=HEAPU8",
         "-o",
     });

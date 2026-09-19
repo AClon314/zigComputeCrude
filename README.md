@@ -48,8 +48,20 @@ tools/check_abi_drift.sh            # 绑定 ABI 漂移检查（native vs emdawn
 ```
 
 `zig build wasm` 后可用 `cd zig-out/webgpu && python3 -m http.server 8080`，
-再用 Chrome 打开 `http://127.0.0.1:8080/shell.html`（页面会跑 CPU SIMD 与 WGSL add 并对拍，
-显示 `GPU add: MATCH` 即通过）。
+再用 Chrome 打开 `http://127.0.0.1:8080/shell.html`。
+
+页面会**逐块测所有能被请求到的 GPU**：浏览器没有 `enumerateAdapters`，所以它用四种请求
+（`auto` / `high-performance` / `low-power` / `forceFallbackAdapter`）枚举，去重后
+**对每块卡跑同一份 WGSL add**（CPU SIMD 参考 + 位精确比较），并对照 JS 侧 `adapter.info`
+与 C ABI 侧自己请求到的适配器身份（防止混合显卡上两边落到不同的卡）。
+`?power=high-perf|low-power|fallback` 指定首轮用哪块卡。
+
+实测（Chrome 154 + Vulkan，本机三块可用适配器）：两个 URL 变体下
+`nvidia · ampere`（auto/high-performance）、`amd · gcn-5`（low-power）、
+`google · swiftshader`（fallback）**全部 MATCH**，且 JS↔C ABI 身份逐块一致；
+表里的 `GPU add` 是单次端到端耗时（含管线创建/上传/回读），只作量级参考，不是稳态基准。
+**浏览器默认偏好按规范是 `low-power`**：不传 `powerPreference` 时拿到的可能是 iGPU，
+这一点与 native 侧一致（见上面「adapter 消融」）。
 
 ---
 

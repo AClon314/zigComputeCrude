@@ -13,10 +13,35 @@ const add_shader = @import("computeAccel_add_shader").source;
 
 const element_count: usize = 1 << 20;
 const status_capacity: usize = 512;
+/// Enough for "vendor | architecture | device | description" in Chrome/Dawn.
+const adapter_info_capacity: usize = 256;
 
 extern fn emscripten_get_now() f64;
 
 var status_storage: [status_capacity]u8 = [_]u8{0} ** status_capacity;
+var adapter_info_storage: [adapter_info_capacity]u8 = [_]u8{0} ** adapter_info_capacity;
+var adapter_info_len: usize = 0;
+
+/// 0 = 未开始/进行中, 1 = 通过, 2 = 失败。页面用它判断一次 run 是否结束，
+/// 避免去解析状态字符串。
+var run_state: u32 = 0;
+var last_gpu_ms: f64 = 0;
+var cpu_simd_ms: f64 = 0;
+
+/// 每次 run 递增，并作为 userdata2 传给异步回调。重启时旧回调必须被丢弃，
+/// 否则上一块 GPU 的 map 回调会写进新一轮的 buffer。
+var run_generation: u32 = 0;
+
+fn generationPtr() ?*anyopaque {
+    return @ptrFromInt(@as(usize, run_generation));
+}
+
+fn setAdapterInfo(text: []const u8) void {
+    const len = @min(text.len, adapter_info_storage.len - 1);
+    @memcpy(adapter_info_storage[0..len], text[0..len]);
+    adapter_info_storage[len] = 0;
+    adapter_info_len = len;
+}
 
 fn setStatus(text: []const u8) void {
     const len = @min(text.len, status_storage.len - 1);
@@ -56,6 +81,57 @@ fn stringView(comptime text: []const u8) wgpu.WGPUStringView {
     return .{ .data = text.ptr, .length = text.len };
 }
 
+/// 这个 helper 与 `gpu/context.zig` 里的同名函数有意重复：context.zig 用了
+/// `std.posix.clock_gettime`，不能进 freestanding wasm 目标。
+fn stringViewSlice(view: wgpu.WGPUStringView) []const u8 {
+    const data = view.data orelse return "";
+    if (view.length == wgpu.WGPU_STRLEN) return std.mem.sliceTo(data, 0);
+    return data[0..view.length];
+}
+
+/// 把适配器身份压成一行 "vendor | architecture | device | description"（跳过空段）。
+/// 页面把它与 JS 侧 `adapter.info` 对比，用来证明 C ABI 侧请求到的确实是同一块 GPU。
+fn captureAdapterInfo(adapter: wgpu.WGPUAdapter) void {
+    var info = wgpu.WGPUAdapterInfo{
+        .nextInChain = null,
+        .vendor = emptyStringView(),
+        .architecture = emptyStringView(),
+        .device = emptyStringView(),
+        .description = emptyStringView(),
+        .backendType = wgpu.WGPUBackendType_Undefined,
+        .adapterType = 0,
+        .vendorID = 0,
+        .deviceID = 0,
+        .subgroupMinSize = 0,
+        .subgroupMaxSize = 0,
+    };
+    if (wgpu.wgpuAdapterGetInfo(adapter, &info) != wgpu.WGPUStatus_Success) {
+        setAdapterInfo("");
+        return;
+    }
+    defer wgpu.wgpuAdapterInfoFreeMembers(info);
+
+    var buffer: [adapter_info_capacity]u8 = undefined;
+    var len: usize = 0;
+    for ([_][]const u8{
+        stringViewSlice(info.vendor),
+        stringViewSlice(info.architecture),
+        stringViewSlice(info.device),
+        stringViewSlice(info.description),
+    }) |part| {
+        if (part.len == 0) continue;
+        if (len != 0 and len + 3 <= buffer.len) {
+            @memcpy(buffer[len .. len + 3], " | ");
+            len += 3;
+        }
+        const copy = @min(part.len, buffer.len - len);
+        @memcpy(buffer[len .. len + copy], part[0..copy]);
+        len += copy;
+        if (copy < part.len) break;
+    }
+    setAdapterInfo(buffer[0..len]);
+}
+
 const Runner = struct {
     // emscripten's malloc updates its JS heap views when memory grows.  The
     // freestanding Zig wasm allocator grows memory directly, which would
@@ -91,7 +167,45 @@ const Runner = struct {
     fn fail(self: *Runner, stage: []const u8) void {
         if (self.done or self.failed) return;
         self.failed = true;
+        run_state = 2;
         setStatusFmt("GPU add: ERROR ({s})", .{stage});
+    }
+
+    /// 释放在一次 run 里创建的 GPU 资源；instance 与 CPU 数组跨 run 复用
+    /// （元素数固定，重建 instance 只会多一份 Dawn 全局状态）。
+    fn releaseRunResources(self: *Runner) void {
+        if (self.bind_group) |handle| wgpu.wgpuBindGroupRelease(handle);
+        if (self.pipeline) |handle| wgpu.wgpuComputePipelineRelease(handle);
+        if (self.pipeline_layout) |handle| wgpu.wgpuPipelineLayoutRelease(handle);
+        if (self.shader_module) |handle| wgpu.wgpuShaderModuleRelease(handle);
+        if (self.input_a) |handle| wgpu.wgpuBufferRelease(handle);
+        if (self.input_b) |handle| wgpu.wgpuBufferRelease(handle);
+        if (self.output) |handle| wgpu.wgpuBufferRelease(handle);
+        if (self.staging) |handle| wgpu.wgpuBufferRelease(handle);
+        if (self.queue) |handle| wgpu.wgpuQueueRelease(handle);
+        if (self.device) |handle| wgpu.wgpuDeviceRelease(handle);
+        if (self.adapter) |handle| wgpu.wgpuAdapterRelease(handle);
+
+        self.bind_group = null;
+        self.pipeline = null;
+        self.pipeline_layout = null;
+        self.shader_module = null;
+        self.input_a = null;
+        self.input_b = null;
+        self.output = null;
+        self.staging = null;
+        self.queue = null;
+        self.device = null;
+        self.adapter = null;
+    }
+
+    fn beginRun(self: *Runner) void {
+        self.releaseRunResources();
+        self.done = false;
+        self.failed = false;
+        self.gpu_start_ms = 0;
+        last_gpu_ms = 0;
+        run_state = 0;
     }
 
     fn setupAndDispatch(self: *Runner) !void {
@@ -262,7 +376,7 @@ const Runner = struct {
             .mode = wgpu.WGPUCallbackMode_AllowProcessEvents,
             .callback = mapCallback,
             .userdata1 = @ptrCast(self),
-            .userdata2 = null,
+            .userdata2 = generationPtr(),
         });
     }
 
@@ -282,9 +396,11 @@ const Runner = struct {
             }
         }
         self.done = true;
+        run_state = 1;
+        last_gpu_ms = nowMs() - self.gpu_start_ms;
         setStatusFmt(
             "GPU add: MATCH (n={}, gpu={d:.3} ms, cpu_simd={d:.3} ms)",
-            .{ element_count, nowMs() - self.gpu_start_ms, self.cpu_ms },
+            .{ element_count, last_gpu_ms, self.cpu_ms },
         );
     }
 };
@@ -299,20 +415,22 @@ fn adapterCallback(
     userdata2: ?*anyopaque,
 ) callconv(.c) void {
     _ = message;
-    _ = userdata2;
     const self = @as(*Runner, @ptrCast(@alignCast(userdata1.?)));
+    if (!isCurrentGeneration(userdata2)) return;
     if (status != wgpu.WGPURequestAdapterStatus_Success or adapter == null) {
+        setAdapterInfo("");
         self.fail("adapter unavailable");
         return;
     }
     self.adapter = adapter;
+    captureAdapterInfo(adapter);
     setStatus("loading: WebGPU device");
     _ = wgpu.wgpuAdapterRequestDevice(self.adapter, null, .{
         .nextInChain = null,
         .mode = wgpu.WGPUCallbackMode_AllowProcessEvents,
         .callback = deviceCallback,
         .userdata1 = @ptrCast(self),
-        .userdata2 = null,
+        .userdata2 = generationPtr(),
     });
 }
 
@@ -324,8 +442,8 @@ fn deviceCallback(
     userdata2: ?*anyopaque,
 ) callconv(.c) void {
     _ = message;
-    _ = userdata2;
     const self = @as(*Runner, @ptrCast(@alignCast(userdata1.?)));
+    if (!isCurrentGeneration(userdata2)) return;
     if (status != wgpu.WGPURequestDeviceStatus_Success or device == null) {
         self.fail("device unavailable");
         return;
@@ -347,8 +465,8 @@ fn mapCallback(
     userdata2: ?*anyopaque,
 ) callconv(.c) void {
     _ = message;
-    _ = userdata2;
     const self = @as(*Runner, @ptrCast(@alignCast(userdata1.?)));
+    if (!isCurrentGeneration(userdata2)) return;
     if (status != wgpu.WGPUMapAsyncStatus_Success) {
         self.fail("readback map");
         return;
@@ -366,47 +484,48 @@ fn mapCallback(
     self.compare();
 }
 
-/// Adapter preference for the browser path, set by the page before
-/// `ca_wasm_main` runs (0 = auto/default, 1 = high-performance, 2 = low-power).
+/// 丢弃上一轮 run 遗留的异步回调。
+fn isCurrentGeneration(userdata2: ?*anyopaque) bool {
+    const ptr = userdata2 orelse return run_generation == 0;
+    return @intFromPtr(ptr) == run_generation;
+}
+
+/// Adapter preference for the browser path (0 = auto/default, 1 = high-performance,
+/// 2 = low-power).  Codes are shared with shell.html's `?power=` parsing.
 ///
 /// The page already chooses an adapter for `preinitializedWebGPUDevice`; passing
 /// the same preference here keeps the C-ABI request from landing on a *different*
 /// GPU on a hybrid laptop (browsers default to low-power, i.e. the integrated
 /// one).  See docs/zig-gpu-spike.md §5.
 var wasm_adapter_preference: wgpu.WGPUPowerPreference = wgpu.WGPUPowerPreference_Undefined;
+var force_fallback_next_run: wgpu.WGPUBool = 0;
 
-export fn ca_wasm_set_adapter_preference(preference: u32) void {
-    wasm_adapter_preference = switch (preference) {
+/// 0 = auto（C 默认）, 1 = high-performance, 2 = low-power, 3 = software fallback.
+/// 浏览器不能枚举适配器，所以"所有可用 GPU"就是这四种请求能拿到的东西。
+fn preferenceFromCode(preference: u32) wgpu.WGPUPowerPreference {
+    return switch (preference) {
         1 => wgpu.WGPUPowerPreference_HighPerformance,
         2 => wgpu.WGPUPowerPreference_LowPower,
         else => wgpu.WGPUPowerPreference_Undefined,
     };
 }
 
-/// Called by the C main() once the emcc module starts.
-export fn ca_wasm_main() void {
-    if (runner.started) return;
-    runner.started = true;
-    setStatus("loading: CPU add");
+fn forceFallbackFromCode(preference: u32) wgpu.WGPUBool {
+    return if (preference == 3) 1 else 0;
+}
 
+export fn ca_wasm_set_adapter_preference(preference: u32) void {
+    wasm_adapter_preference = preferenceFromCode(preference);
+    force_fallback_next_run = forceFallbackFromCode(preference);
+}
+
+fn setupCpuReference() bool {
     const allocator = runner.allocator;
     runner.byte_size = element_count * @sizeOf(f32);
-    runner.a = allocator.alloc(f32, element_count) catch {
-        runner.fail("CPU allocation");
-        return;
-    };
-    runner.b = allocator.alloc(f32, element_count) catch {
-        runner.fail("CPU allocation");
-        return;
-    };
-    runner.cpu_result = allocator.alloc(f32, element_count) catch {
-        runner.fail("CPU allocation");
-        return;
-    };
-    runner.gpu_result = allocator.alloc(f32, element_count) catch {
-        runner.fail("CPU allocation");
-        return;
-    };
+    runner.a = allocator.alloc(f32, element_count) catch return false;
+    runner.b = allocator.alloc(f32, element_count) catch return false;
+    runner.cpu_result = allocator.alloc(f32, element_count) catch return false;
+    runner.gpu_result = allocator.alloc(f32, element_count) catch return false;
 
     for (0..element_count) |i| {
         runner.a.?[i] = @as(f32, @floatFromInt(i % 97)) * 0.25;
@@ -414,22 +533,78 @@ export fn ca_wasm_main() void {
     }
     const cpu_start = nowMs();
     cpuSimdAdd(runner.cpu_result.?, runner.a.?, runner.b.?);
-    runner.cpu_ms = nowMs() - cpu_start;
+    cpu_simd_ms = nowMs() - cpu_start;
+    runner.cpu_ms = cpu_simd_ms;
+    return true;
+}
 
-    runner.instance = wgpu.wgpuCreateInstance(null) orelse {
-        runner.fail("instance unavailable");
-        return;
-    };
+/// 起一次 run：CPU 参考只算一次，GPU 侧每次重建（换 adapter 时旧资源先释放）。
+fn startRun() void {
+    run_generation +%= 1;
+    if (run_generation == 0) run_generation = 1;
+    runner.beginRun();
+    setAdapterInfo("");
+
+    if (runner.a == null) {
+        setStatus("loading: CPU add");
+        if (!setupCpuReference()) {
+            runner.fail("CPU allocation");
+            return;
+        }
+    }
+
+    if (runner.instance == null) {
+        runner.instance = wgpu.wgpuCreateInstance(null) orelse {
+            runner.fail("instance unavailable");
+            return;
+        };
+    }
     setStatus("loading: WebGPU adapter");
     var adapter_options = wgpu.WGPURequestAdapterOptions.initial;
     adapter_options.powerPreference = wasm_adapter_preference;
+    adapter_options.forceFallbackAdapter = force_fallback_next_run;
     _ = wgpu.wgpuInstanceRequestAdapter(runner.instance, &adapter_options, .{
         .nextInChain = null,
         .mode = wgpu.WGPUCallbackMode_AllowProcessEvents,
         .callback = adapterCallback,
         .userdata1 = @ptrCast(&runner),
-        .userdata2 = null,
+        .userdata2 = generationPtr(),
     });
+}
+
+/// Called by the C main() once the emcc module starts (first run, using the
+/// preference set through `ca_wasm_set_adapter_preference`).
+export fn ca_wasm_main() void {
+    if (runner.started) return;
+    runner.started = true;
+    startRun();
+}
+
+/// 页面用它逐块 GPU 重跑：0 = auto, 1 = high-performance, 2 = low-power。
+/// 与 `ca_wasm_run_state()` 配合即可在 JS 侧串起一块块适配器。
+export fn ca_wasm_run(preference: u32) void {
+    wasm_adapter_preference = preferenceFromCode(preference);
+    force_fallback_next_run = forceFallbackFromCode(preference);
+    startRun();
+}
+
+/// 0 = 未开始/进行中, 1 = 通过, 2 = 失败（避免 JS 解析状态字符串）。
+export fn ca_wasm_run_state() u32 {
+    return run_state;
+}
+
+/// 本轮 run 里 C ABI 侧实际拿到的适配器身份（"vendor | architecture | device |
+/// description"，可能为空）。页面把它与 JS 侧 `adapter.info` 对照。
+export fn ca_wasm_adapter_info() [*:0]const u8 {
+    return @ptrCast(&adapter_info_storage);
+}
+
+export fn ca_wasm_last_gpu_ms() f64 {
+    return last_gpu_ms;
+}
+
+export fn ca_wasm_cpu_simd_ms() f64 {
+    return cpu_simd_ms;
 }
 
 /// The page calls this once per animation frame.  It is deliberately the only
