@@ -229,6 +229,42 @@ fn requireValue(writer: *Io.Writer, args: anytype, index: usize, flag: []const u
     return false;
 }
 
+/// 单次 submit 的 GPU 工作量预算（墙钟纳秒）。
+///
+/// 本机 iGPU（RADV / amdgpu）实测：把 ~1.63 s 的 GPU 工作放进一个 submit 能过，
+/// ~2.45 s 会触发驱动 `ring gfx timeout` → amdgpu 重置 ring → context lost →
+/// wgpu-native 在 `wgpuQueueSubmit` 上**直接 abort（无法捕获）**，还会连带重置
+/// 桌面合成器的 GPU 上下文。所以唯一可行的对策是**提交前夹住工作量**。
+/// 取 1500 ms 留余量，并**按实测**的 per-dispatch 耗时换算，而不是猜设备速度。
+const submit_budget_ns: u64 = 1_500_000_000;
+
+/// 把批量迭代数夹到"一个 submit 不超过预算"。`per_dispatch_ns` 用端到端实测值
+/// （含上传/回读）→ 偏保守。被夹住时打印原因，避免"数字变小了却不知道为什么"。
+fn clampBatchIters(
+    writer: *Io.Writer,
+    requested: usize,
+    per_dispatch_ns: u64,
+    what: []const u8,
+) !usize {
+    if (per_dispatch_ns == 0 or requested <= 1) return requested;
+    const max_iters = @max(@as(u64, 1), submit_budget_ns / per_dispatch_ns);
+    const allowed: usize = @intCast(@min(@as(u64, requested), max_iters));
+    if (allowed < requested) {
+        try writer.print(
+            "  {s}: 批量迭代 {d} → {d}（单 submit 预算 {d} ms / 实测每次 {d} ms；" ++
+                "再长会触发 iGPU 驱动 ring timeout，见 README「限制与已知边界」）\n",
+            .{
+                what,
+                requested,
+                allowed,
+                submit_budget_ns / 1_000_000,
+                per_dispatch_ns / 1_000_000,
+            },
+        );
+    }
+    return allowed;
+}
+
 fn maxAbsValue(data: []const f32) f32 {
     var max_value: f32 = 0;
     for (data) |value| max_value = @max(max_value, @abs(value));
@@ -724,6 +760,7 @@ fn runGemmDemo(
         );
 
         if (iters > 1) {
+            const batch_iters = try clampBatchIters(writer, iters, gpu_ns / iters, variant.name());
             const batch_ns = computeAccel.bench.timeGemmBatched(
                 variant,
                 m,
@@ -732,7 +769,7 @@ fn runGemmDemo(
                 a,
                 b,
                 work,
-                iters,
+                batch_iters,
             ) catch |err| {
                 try writer.print(
                     "gpu_{s}_batch: 计时失败（{s}）\n",
@@ -746,13 +783,13 @@ fn runGemmDemo(
                     variant.name(),
                     if (variant == .simple) " " else "  ",
                     batch_ns,
-                    gflops(total_flops, batch_ns),
+                    gflops(total_flops / @as(f64, @floatFromInt(iters)) * @as(f64, @floatFromInt(batch_iters)), batch_ns),
                 },
             );
             try writer.print(
                 "  steady-state (1 upload + {} dispatches + 1 readback); speedup vs cpu_simd = {d:.2}x\n",
                 .{
-                    iters,
+                    batch_iters,
                     if (simd_ns == 0) 0.0 else @as(f64, @floatFromInt(simd_ns)) / @as(f64, @floatFromInt(batch_ns)),
                 },
             );
@@ -866,7 +903,8 @@ fn runReduceDemo(
     );
 
     if (iters > 1) {
-        const batch_ns = computeAccel.bench.timeReduceBatched(op, &gpu_value, input, iters) catch |err| {
+        const batch_iters = try clampBatchIters(writer, iters, gpu_ns / iters, op.name());
+        const batch_ns = computeAccel.bench.timeReduceBatched(op, &gpu_value, input, batch_iters) catch |err| {
             try writer.print(
                 "gpu_batch: 计时失败（{s}）\n",
                 .{computeAccel.gpu.lastFallbackReason() orelse @errorName(err)},
@@ -876,12 +914,15 @@ fn runReduceDemo(
         if (batch_ns != 0) {
             try writer.print(
                 "gpu_batch    {}   {d:.3}\n",
-                .{ batch_ns, bytesPerNsGbps(total_bytes, batch_ns) },
+                .{
+                    batch_ns,
+                    bytesPerNsGbps(total_bytes / iters * batch_iters, batch_ns),
+                },
             );
             try writer.print(
                 "  steady-state (1 upload + {} reductions + 1 readback); speedup vs cpu_simd = {d:.2}x\n",
                 .{
-                    iters,
+                    batch_iters,
                     if (simd_ns == 0) 0.0 else @as(f64, @floatFromInt(simd_ns)) / @as(f64, @floatFromInt(batch_ns)),
                 },
             );

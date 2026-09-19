@@ -314,7 +314,7 @@ CLI 还会验证固定容量邻接表（K=16）：对未被截断的查询比较
 | -------------- | ------------ | ----------------- | ------------------ | ------------------ |
 | GEMM 512³      | 60.3 GFLOP/s | 75.5 (1.3x)       | 175.3 (2.9x)       | 216.8 (3.6x)       |
 | GEMM 1024³     | 42.9         | 29.1 (0.7x)       | 194.0 (4.5x)       | 226.3 (5.3x)       |
-| GEMM 2048³     | —（见注）    | —                 | —                  | —                  |
+| GEMM 2048³     | 19.2         | 21.0 (1.10x)      | 216.2 (11.3x)      | 234.1 (12.2x)¹     |
 | reduce 4M sum  | 45.8 GB/s    | 6.1 (端到端)      | —                  | 18.3 (稳态)        |
 | reduce 16M sum | 29.7         | 7.0               | —                  | 26.2（**输给 CPU**）|
 
@@ -327,12 +327,18 @@ CPU SIMD**（CPU 侧 SIMD 归约经多累加器优化后在 16 MiB 上 29.7 GB/s
 真正价值是**链式**（5.8x over per-call）而不是单步吞吐。
 
 注：CPU 侧两个 comptime 旋钮（GEMM 分块行数、归约累加器）的实测与判定见
-`docs/perf-tooling-and-comptime.md`；`GEMM 2048³` 本次会话在本机 iGPU 上复现
-"Parent device is lost"（wgpu-native 直接 abort，未取到数），故此行为空。
+`docs/perf-tooling-and-comptime.md`。
+¹ `GEMM 2048³ simple` 的批量列被**单 submit 预算**夹到 1 次 dispatch（实测每次 ~816 ms；
+再长会触发 iGPU 驱动 ring timeout，见「限制与已知边界」），tiled 未受影响。
 
 ---
 
 ## 限制与已知边界
+
+- **单个 submit 的 GPU 工作量必须远小于 ~2 s**（本机 iGPU/RADV 实测：1.63 s 通过、
+  2.45 s 触发 `ring gfx timeout` → amdgpu 硬恢复"context is lost" → wgpu-native 在
+  `wgpuQueueSubmit` 上**直接 abort，无法用 error scope 捕获**）。CLI 的批量基准按**实测**
+  的 per-dispatch 时间把迭代数夹到 1.5 s 预算内并打印提示；库层不管这件事（预算归调用方）。
 
 - GPU 内核目前只有 `f32`；非 f32 会走 CPU SIMD 并记录原因。
 - dispatch 的 2D 展平上限：两轴各 `maxComputeWorkgroupsPerDimension`（通常 65535），

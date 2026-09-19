@@ -173,6 +173,12 @@ tree-shake 门禁有正负两侧：`build.zig` 里的 probe 只调用 CPU 路径
   对 validation error 直接 abort）。做法：写 count 与间接派发拆成两次 dispatch、
   两个 shader（参见 `indirect_probe.wgsl` / `indirect_fill.wgsl` 与
   `Chain.dispatchIndirect` 的测试）；control buffer 用 `runtime.buffer.indirect`。
+- **单个 submit 别放超过 ~1.5 s 的 GPU 工作**：本机 iGPU（RADV/amdgpu）实测 1.63 s 的单 submit
+  通过、2.45 s 触发 `ring gfx timeout` → amdgpu 硬恢复（日志 `context is lost ... guilty of a
+  hard recovery`）→ wgpu-native 在 `wgpuQueueSubmit` 上 **abort**（error scope 捕不到，还会连带
+  重置桌面合成器上下文）。所以"批量 N 次 dispatch 一次提交"的基准必须按实测 per-dispatch
+  耗时夹住 N（`main.zig::clampBatchIters`，预算 1500 ms）；库层不替调用方管预算，
+  但文档/CLI 要给默认值与告警。诊断入口：`journalctl -k | rg amdgpu` 看 ring timeout。
 - **`Chain.wait()` 必须被调用**：`submitAsync()` 只提交，不调用 `wait()` 时
   `download()` 的 out 切片不会被写入（数据仍在 device 上），`deinit()` 也不会自动
   `wait`；每个 submit 路径都要配一次 wait（`submit()` = 两者合一）。
